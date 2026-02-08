@@ -8,129 +8,84 @@ const SYMBOLS = {
 };
 
 export default function Home() {
-  const chartContainerRef = useRef(null);
-  const candleSeriesRef = useRef(null);
   const chartRef = useRef(null);
+  const seriesRef = useRef(null);
   const wsRef = useRef(null);
 
   const [symbol, setSymbol] = useState("R_75");
   const [price, setPrice] = useState("-");
 
-  // إنشاء الشارت (Client-only)
+  // إنشاء الشارت
   useEffect(() => {
-    let isMounted = true;
+    let alive = true;
 
-    async function initChart() {
-      if (!chartContainerRef.current) return;
+    (async () => {
+      const { createChart } = await import("lightweight-charts");
+      if (!alive) return;
 
-      const mod = await import("lightweight-charts");
-      if (!isMounted) return;
-
-      const chart = mod.createChart(chartContainerRef.current, {
-        width: chartContainerRef.current.clientWidth,
-        height: 320,
+      const chart = createChart(document.getElementById("chart"), {
+        width: window.innerWidth - 40,
+        height: 300,
         timeScale: { timeVisible: true, secondsVisible: true }
       });
 
-      const candleSeries = chart.addCandlestickSeries();
-
+      const series = chart.addCandlestickSeries();
       chartRef.current = chart;
-      candleSeriesRef.current = candleSeries;
+      seriesRef.current = series;
+    })();
 
-      const onResize = () => {
-        if (!chartContainerRef.current || !chartRef.current) return;
-        chartRef.current.applyOptions({
-          width: chartContainerRef.current.clientWidth
-        });
-      };
-      window.addEventListener("resize", onResize);
-
-      return () => window.removeEventListener("resize", onResize);
-    }
-
-    initChart();
-
-    return () => {
-      isMounted = false;
-      try {
-        if (wsRef.current) wsRef.current.close();
-      } catch {}
-      try {
-        if (chartRef.current) chartRef.current.remove();
-      } catch {}
-    };
+    return () => { alive = false; };
   }, []);
 
-  // اشتراك الأسعار وتحديث الشموع (شموع 1 دقيقة)
+  // السعر + الشموع
   useEffect(() => {
-    if (!candleSeriesRef.current) return;
+    if (wsRef.current) wsRef.current.close();
 
-    // أغلق الاشتراك السابق
-    try {
-      if (wsRef.current) wsRef.current.close();
-    } catch {}
+    const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
+    wsRef.current = ws;
 
-    // امسح بيانات الشارت
-    candleSeriesRef.current.setData([]);
+    let candle = null;
 
-    const socket = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
-    wsRef.current = socket;
-
-    let lastCandle = null;
-
-    socket.onopen = () => {
-      socket.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
     };
 
-    socket.onmessage = (msg) => {
-      const data = JSON.parse(msg.data);
-      if (!data.tick) return;
+    ws.onmessage = (e) => {
+      const d = JSON.parse(e.data);
+      if (!d.tick) return;
 
-      const t = Math.floor(data.tick.epoch);
-      const p = Number(data.tick.quote);
+      const t = Math.floor(d.tick.epoch / 60) * 60;
+      const p = d.tick.quote;
 
       setPrice(p);
 
-      // نجمع ticks داخل شمعة دقيقة واحدة
-      if (!lastCandle || t - lastCandle.time >= 60) {
-        lastCandle = { time: t, open: p, high: p, low: p, close: p };
-        candleSeriesRef.current.update(lastCandle);
+      if (!candle || candle.time !== t) {
+        candle = { time: t, open: p, high: p, low: p, close: p };
+        seriesRef.current?.update(candle);
       } else {
-        lastCandle.high = Math.max(lastCandle.high, p);
-        lastCandle.low = Math.min(lastCandle.low, p);
-        lastCandle.close = p;
-        candleSeriesRef.current.update(lastCandle);
+        candle.high = Math.max(candle.high, p);
+        candle.low = Math.min(candle.low, p);
+        candle.close = p;
+        seriesRef.current?.update(candle);
       }
     };
 
-    socket.onerror = () => {
-      // إذا صار خطأ بالسوكت، نخلي السعر يظل ظاهر بس بدون تحديثات
-    };
-
-    return () => {
-      try {
-        socket.close();
-      } catch {}
-    };
+    return () => ws.close();
   }, [symbol]);
 
   return (
     <div style={{ direction: "rtl", padding: 20, fontFamily: "Tahoma" }}>
       <h2>📊 تحليل الخيارات الثنائية – Deriv</h2>
 
-      <div style={{ marginBottom: 10 }}>
-        <select value={symbol} onChange={(e) => setSymbol(e.target.value)}>
-          {Object.entries(SYMBOLS).map(([name, code]) => (
-            <option key={code} value={code}>
-              {name}
-            </option>
-          ))}
-        </select>
-      </div>
+      <select value={symbol} onChange={e => setSymbol(e.target.value)}>
+        {Object.entries(SYMBOLS).map(([n, v]) => (
+          <option key={v} value={v}>{n}</option>
+        ))}
+      </select>
 
       <p><b>السعر المباشر:</b> {price}</p>
 
-      <div ref={chartContainerRef} style={{ width: "100%", marginTop: 10 }} />
+      <div id="chart" style={{ width: "100%", marginTop: 10 }} />
 
       <small style={{ color: "gray" }}>
         بيانات مباشرة من Deriv – شموع دقيقة واحدة
