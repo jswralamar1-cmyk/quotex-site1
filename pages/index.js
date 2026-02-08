@@ -1,18 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 
-/**
- * Deriv Binary Analyzer — Enhanced Professional Version
- * ✅ تحسينات أضفتها:
- * 1. إدارة اتصال WebSocket أفضل (reconnect logic)
- * 2. معالجة أخطاء محسنة (Error Boundaries)
- * 3. تحسين الأداء (debounce, useCallback)
- * 4. مؤشرات فنية إضافية (Bollinger Bands, Stochastic)
- * 5. تنبيهات متعددة (صوتي، مرئي، إشعارات)
- * 6. حفظ بيانات أكثر تفصيلاً
- * 7. Responsive design أفضل
- * 8. TypeScript-ready annotations
- */
-
 const ASSETS = [
   { label: "Volatility 75", symbol: "R_75" },
   { label: "Volatility 100", symbol: "R_100" },
@@ -31,77 +18,57 @@ const DURATIONS = [
   { label: "15 دقيقة", sec: 900 }
 ];
 
-// Keys for localStorage
 const LS_KEY = "deriv_analyzer_pro_settings";
 const LS_HIST = "deriv_analyzer_pro_history";
-const LS_CANDLES = "deriv_analyzer_candles_cache";
 
-// Utility functions
-const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const nowSec = () => Math.floor(Date.now() / 1000);
-const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
-const stdDev = arr => {
+const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
+const stdDev = (arr) => {
+  if (!arr.length) return 0;
   const mean = avg(arr);
   return Math.sqrt(arr.reduce((sq, n) => sq + Math.pow(n - mean, 2), 0) / arr.length);
 };
 const bucketStart = (epoch, durationSec) => epoch - (epoch % durationSec);
 
-// Enhanced audio alerts with different tones
 const playAlert = (type = "signal") => {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const oscillator = ctx.createOscillator();
-    const gainNode = ctx.createGain();
-    
-    oscillator.connect(gainNode);
-    gainNode.connect(ctx.destination);
-    
-    // Different tones for different alerts
-    switch(type) {
-      case "buy":
-        oscillator.frequency.setValueAtTime(800, ctx.currentTime);
-        break;
-      case "sell":
-        oscillator.frequency.setValueAtTime(400, ctx.currentTime);
-        break;
-      case "warning":
-        oscillator.frequency.setValueAtTime(600, ctx.currentTime);
-        break;
-      default:
-        oscillator.frequency.setValueAtTime(660, ctx.currentTime);
-    }
-    
-    gainNode.gain.setValueAtTime(0.1, ctx.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
-    
-    oscillator.start(ctx.currentTime);
-    oscillator.stop(ctx.currentTime + 0.3);
-    
-    setTimeout(() => ctx.close(), 500);
-  } catch (error) {
-    console.warn("Audio alert failed:", error);
-  }
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.frequency.setValueAtTime(
+      type === "buy" ? 800 : type === "sell" ? 400 : type === "warning" ? 600 : 660,
+      ctx.currentTime
+    );
+
+    gain.gain.setValueAtTime(0.1, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
+
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.25);
+    setTimeout(() => ctx.close(), 400);
+  } catch {}
 };
 
-// WebSocket connection manager
 class DerivWSManager {
   constructor() {
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
-    this.reconnectDelay = 2000;
-    this.subscriptions = new Set();
+    this.reconnectDelay = 1500;
     this.isConnected = false;
+    this.reconnectTimer = null;
   }
 
   connect(onMessage, onOpen, onClose, onError) {
     try {
       this.ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
-      
+
       this.ws.onopen = () => {
         this.isConnected = true;
         this.reconnectAttempts = 0;
-        console.log("✅ WebSocket connected to Deriv");
         onOpen?.();
       };
 
@@ -109,128 +76,109 @@ class DerivWSManager {
 
       this.ws.onclose = () => {
         this.isConnected = false;
-        console.log("WebSocket disconnected");
         onClose?.();
         this.attemptReconnect(onMessage, onOpen, onClose, onError);
       };
 
-      this.ws.onerror = (error) => {
-        console.error("WebSocket error:", error);
-        onError?.(error);
-      };
-    } catch (error) {
-      console.error("Failed to create WebSocket:", error);
-      onError?.(error);
+      this.ws.onerror = (err) => onError?.(err);
+    } catch (err) {
+      onError?.(err);
     }
   }
 
   attemptReconnect(onMessage, onOpen, onClose, onError) {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error("Max reconnection attempts reached");
-      return;
-    }
-
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
     this.reconnectAttempts++;
-    console.log(`Reconnecting... Attempt ${this.reconnectAttempts}`);
 
-    setTimeout(() => {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
       this.connect(onMessage, onOpen, onClose, onError);
     }, this.reconnectDelay * this.reconnectAttempts);
   }
 
-  subscribe(asset) {
+  send(payload) {
     if (!this.isConnected || !this.ws) return false;
-    
     try {
-      this.ws.send(JSON.stringify({ 
-        ticks: asset, 
-        subscribe: 1,
-        style: "ticks"
-      }));
-      
-      this.subscriptions.add(asset);
+      this.ws.send(JSON.stringify(payload));
       return true;
-    } catch (error) {
-      console.error("Subscribe failed:", error);
+    } catch {
       return false;
     }
   }
 
-  unsubscribe(asset) {
-    if (!this.isConnected || !this.ws) return;
-    
-    try {
-      this.ws.send(JSON.stringify({ 
-        ticks: asset, 
-        subscribe: 0 
-      }));
-      this.subscriptions.delete(asset);
-    } catch (error) {
-      console.error("Unsubscribe failed:", error);
-    }
+  subscribeTicks(asset) {
+    return this.send({ ticks: asset, subscribe: 1 });
   }
 
-  requestHistory(asset, durationSec, count = 200) {
-    if (!this.isConnected || !this.ws) return false;
-    
-    try {
-      this.ws.send(JSON.stringify({
-        ticks_history: asset,
-        adjust_start_time: 1,
-        count,
-        end: "latest",
-        start: 1,
-        style: "candles",
-        granularity: durationSec
-      }));
-      return true;
-    } catch (error) {
-      console.error("History request failed:", error);
-      return false;
-    }
+  requestHistoryCandles(asset, durationSec, count = 200) {
+    // ✅ حل 10s/30s: نخلي التاريخ 60 ثانية إذا المدة أقل
+    const gran = durationSec < 60 ? 60 : durationSec;
+
+    return this.send({
+      ticks_history: asset,
+      adjust_start_time: 1,
+      count,
+      end: "latest",
+      start: 1,
+      style: "candles",
+      granularity: gran
+    });
   }
 
   disconnect() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+
     if (this.ws) {
-      this.subscriptions.clear();
-      this.ws.close();
+      try { this.ws.close(); } catch {}
       this.ws = null;
-      this.isConnected = false;
     }
+    this.isConnected = false;
   }
 }
 
 export default function Home() {
-  // Refs
+  // Chart refs
   const containerRef = useRef(null);
   const chartRef = useRef(null);
-  const seriesRef = useRef(null);
+  const candleSeriesRef = useRef(null);
+  const volumeSeriesRef = useRef(null);
+  const srLinesRef = useRef([]); // support/resistance lines (price lines)
+
+  // Data refs
   const wsManagerRef = useRef(new DerivWSManager());
-  const lastCandleRef = useRef(null);
   const candlesRef = useRef([]);
+  const lastCandleRef = useRef(null);
+
   const lastAlertRef = useRef({ time: 0, type: "" });
 
-  // State
+  // UI state
   const [asset, setAsset] = useState(ASSETS[0].symbol);
   const [durationSec, setDurationSec] = useState(60);
   const [price, setPrice] = useState("-");
   const [countdown, setCountdown] = useState(0);
   const [connectionStatus, setConnectionStatus] = useState("connecting");
   const [dark, setDark] = useState(false);
-  const [risk, setRisk] = useState("متوسط");
+
   const [alertOn, setAlertOn] = useState(true);
   const [alertMinConf, setAlertMinConf] = useState(72);
-  const [notification, setNotification] = useState(null);
 
-  // Indicators toggle
+  const [notification, setNotification] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+
   const [indicators, setIndicators] = useState({
     RSI: true,
     EMA: true,
     MACD: true,
     BB: false,
     Stochastic: false,
-    Volume: false
+    Volume: true, // ✅ خليته true افتراضياً حتى تشتغل
+    SR: true // ✅ دعم/مقاومة
   });
+
+  // Fullscreen
+  const [isFull, setIsFull] = useState(false);
 
   const [analysis, setAnalysis] = useState({
     dir: "—",
@@ -238,85 +186,10 @@ export default function Home() {
     ok: false,
     market: "انتظر...",
     reasons: ["انتظر..."],
-    strategies: { trend: 0, reversal: 0, range: 0, breakout: 0 },
-    signals: {
-      rsi: null,
-      macd: null,
-      bb: null,
-      stochastic: null,
-      volume: null
-    }
+    short: "—"
   });
 
-  const [history, setHistory] = useState([]);
-  const [isLoading, setIsLoading] = useState(false);
-
-  // Load settings with better error handling
-  useEffect(() => {
-    const loadSettings = () => {
-      try {
-        const saved = localStorage.getItem(LS_KEY);
-        if (saved) {
-          const settings = JSON.parse(saved);
-          
-          // Validate and apply settings
-          if (typeof settings.dark === 'boolean') setDark(settings.dark);
-          if (typeof settings.durationSec === 'number') setDurationSec(settings.durationSec);
-          if (typeof settings.asset === 'string') setAsset(settings.asset);
-          if (settings.risk) setRisk(settings.risk);
-          if (typeof settings.alertOn === 'boolean') setAlertOn(settings.alertOn);
-          if (typeof settings.alertMinConf === 'number') setAlertMinConf(settings.alertMinConf);
-          if (settings.indicators) setIndicators(prev => ({ ...prev, ...settings.indicators }));
-          
-          console.log("Settings loaded successfully");
-        }
-      } catch (error) {
-        console.error("Failed to load settings:", error);
-        // Use defaults
-      }
-    };
-
-    loadSettings();
-  }, []);
-
-  // Save settings with debounce
-  useEffect(() => {
-    const timeoutId = setTimeout(() => {
-      try {
-        localStorage.setItem(LS_KEY, JSON.stringify({
-          dark,
-          durationSec,
-          asset,
-          risk,
-          alertOn,
-          alertMinConf,
-          indicators,
-          lastUpdated: Date.now()
-        }));
-      } catch (error) {
-        console.error("Failed to save settings:", error);
-      }
-    }, 500);
-
-    return () => clearTimeout(timeoutId);
-  }, [dark, durationSec, asset, risk, alertOn, alertMinConf, indicators]);
-
-  // Countdown timer
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const left = durationSec - (nowSec() % durationSec);
-      setCountdown(left);
-      
-      // Auto-refresh analysis near candle close
-      if (left === 5 || left === 10) {
-        runAnalysis("countdown");
-      }
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [durationSec]);
-
-  // Theme configuration
+  // theme
   const theme = useMemo(() => {
     const bg = dark ? "#0f172a" : "#ffffff";
     const fg = dark ? "#f1f5f9" : "#0f172a";
@@ -326,180 +199,445 @@ export default function Home() {
     const blue = dark ? "#60a5fa" : "#3b82f6";
     const green = dark ? "#34d399" : "#10b981";
     const red = dark ? "#f87171" : "#ef4444";
-    
     return { bg, fg, card, border, soft, blue, green, red };
   }, [dark]);
 
-  // Initialize chart with enhanced options
+  // load settings + history
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(LS_KEY);
+      if (saved) {
+        const s = JSON.parse(saved);
+        if (typeof s.dark === "boolean") setDark(s.dark);
+        if (typeof s.durationSec === "number") setDurationSec(s.durationSec);
+        if (typeof s.asset === "string") setAsset(s.asset);
+        if (typeof s.alertOn === "boolean") setAlertOn(s.alertOn);
+        if (typeof s.alertMinConf === "number") setAlertMinConf(s.alertMinConf);
+        if (s.indicators) setIndicators((p) => ({ ...p, ...s.indicators }));
+      }
+    } catch {}
+
+    try {
+      const h = localStorage.getItem(LS_HIST);
+      if (h) setHistory(JSON.parse(h));
+    } catch {}
+  }, []);
+
+  // save settings debounce
+  useEffect(() => {
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(
+          LS_KEY,
+          JSON.stringify({ dark, durationSec, asset, alertOn, alertMinConf, indicators })
+        );
+      } catch {}
+    }, 400);
+    return () => clearTimeout(t);
+  }, [dark, durationSec, asset, alertOn, alertMinConf, indicators]);
+
+  // countdown
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const left = durationSec - (nowSec() % durationSec);
+      setCountdown(left);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [durationSec]);
+
+  // ✅ تحليل دوري: كل دقيقة (حتى لو ما تكمل 40 شمعة)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      runAnalysis("timer_1m");
+    }, 60_000);
+    return () => clearInterval(interval);
+  }, [asset, durationSec, indicators]); // يعتمد على المؤشرات
+
+  // Helper: update S/R (support/resistance)
+  const updateSRLines = useCallback(() => {
+    if (!chartRef.current || !candleSeriesRef.current) return;
+    if (!indicators.SR) {
+      // remove lines if disabled
+      srLinesRef.current.forEach((l) => candleSeriesRef.current.removePriceLine(l));
+      srLinesRef.current = [];
+      return;
+    }
+
+    const candles = candlesRef.current;
+    if (!candles || candles.length < 20) return;
+
+    // clear old
+    srLinesRef.current.forEach((l) => candleSeriesRef.current.removePriceLine(l));
+    srLinesRef.current = [];
+
+    const lastN = candles.slice(-50);
+    const highs = lastN.map((c) => c.high);
+    const lows = lastN.map((c) => c.low);
+
+    const resistance = Math.max(...highs);
+    const support = Math.min(...lows);
+
+    const rLine = candleSeriesRef.current.createPriceLine({
+      price: resistance,
+      color: theme.red,
+      lineWidth: 2,
+      lineStyle: 2,
+      axisLabelVisible: true,
+      title: "مقاومة"
+    });
+
+    const sLine = candleSeriesRef.current.createPriceLine({
+      price: support,
+      color: theme.green,
+      lineWidth: 2,
+      lineStyle: 2,
+      axisLabelVisible: true,
+      title: "دعم"
+    });
+
+    srLinesRef.current = [rLine, sLine];
+  }, [indicators.SR, theme.red, theme.green]);
+
+  // init chart + volume
   useEffect(() => {
     let chart = null;
     let alive = true;
 
-    const initChart = async () => {
+    const init = async () => {
       if (!alive || !containerRef.current) return;
+      const { createChart } = await import("lightweight-charts");
 
-      try {
-        const { createChart } = await import("lightweight-charts");
-        
-        chart = createChart(containerRef.current, {
-          width: containerRef.current.clientWidth,
-          height: 400,
-          layout: {
-            background: { color: theme.bg },
-            textColor: theme.fg,
-            fontSize: 12
-          },
-          grid: {
-            vertLines: { 
-              color: dark ? "rgba(255, 255, 255, 0.05)" : "rgba(0, 0, 0, 0.05)",
-              visible: true 
-            },
-            horzLines: { 
-              color: dark ? "rgba(255, 255, 255, 0.05)" : "rgba(0, 0, 0, 0.05)",
-              visible: true 
-            }
-          },
-          timeScale: {
-            timeVisible: true,
-            secondsVisible: durationSec <= 60,
-            borderColor: theme.border,
-            rightOffset: 12
-          },
-          rightPriceScale: {
-            borderColor: theme.border,
-            scaleMargins: {
-              top: 0.1,
-              bottom: 0.2
-            }
-          },
-          crosshair: {
-            mode: 1,
-            vertLine: {
-              color: theme.blue,
-              width: 1,
-              style: 3
-            },
-            horzLine: {
-              color: theme.blue,
-              width: 1,
-              style: 3
-            }
-          }
-        });
+      chart = createChart(containerRef.current, {
+        width: containerRef.current.clientWidth,
+        height: isFull ? 520 : 400,
+        layout: { background: { color: theme.bg }, textColor: theme.fg, fontSize: 12 },
+        grid: {
+          vertLines: { color: dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)" },
+          horzLines: { color: dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)" }
+        },
+        timeScale: { timeVisible: true, secondsVisible: durationSec <= 60, rightOffset: 12 },
+        crosshair: { mode: 1 }
+      });
 
-        const series = chart.addCandlestickSeries({
-          upColor: theme.green,
-          downColor: theme.red,
-          borderVisible: false,
-          wickUpColor: theme.green,
-          wickDownColor: theme.red
-        });
+      const candleSeries = chart.addCandlestickSeries({
+        upColor: theme.green,
+        downColor: theme.red,
+        borderVisible: false,
+        wickUpColor: theme.green,
+        wickDownColor: theme.red
+      });
 
-        chartRef.current = chart;
-        seriesRef.current = series;
+      chartRef.current = chart;
+      candleSeriesRef.current = candleSeries;
 
-        // Add volume series if enabled
-        if (indicators.Volume) {
-          const volumeSeries = chart.addHistogramSeries({
-            color: theme.blue,
-            priceFormat: {
-              type: 'volume',
-            },
-            priceScaleId: 'volume',
-            scaleMargins: {
-              top: 0.8,
-              bottom: 0,
-            },
-          });
-        }
+      // ✅ Volume series (جاهز حتى لو Off)
+      volumeSeriesRef.current = chart.addHistogramSeries({
+        priceFormat: { type: "volume" },
+        priceScaleId: "vol",
+        scaleMargins: { top: 0.8, bottom: 0 }
+      });
 
-        // Handle resize
-        const handleResize = () => {
-          if (chart && containerRef.current) {
-            chart.applyOptions({ 
-              width: containerRef.current.clientWidth 
-            });
-          }
-        };
+      const resize = () => {
+        if (!chart || !containerRef.current) return;
+        chart.applyOptions({ width: containerRef.current.clientWidth });
+      };
+      window.addEventListener("resize", resize);
 
-        window.addEventListener('resize', handleResize);
-
-        return () => {
-          window.removeEventListener('resize', handleResize);
-        };
-      } catch (error) {
-        console.error("Failed to initialize chart:", error);
+      // load any existing candles
+      if (candlesRef.current.length) {
+        candleSeries.setData(candlesRef.current);
+        const volData = candlesRef.current.map((c) => ({
+          time: c.time,
+          value: c.volume || 0,
+          color: c.close >= c.open ? theme.green : theme.red
+        }));
+        volumeSeriesRef.current.setData(volData);
       }
+
+      updateSRLines();
+
+      return () => window.removeEventListener("resize", resize);
     };
 
-    initChart();
+    init();
 
     return () => {
       alive = false;
-      if (chart) {
-        chart.remove();
-      }
+      if (chart) chart.remove();
     };
-  }, [dark, theme, durationSec, indicators.Volume]);
+  }, [dark, theme, durationSec, isFull, updateSRLines]);
 
-  // WebSocket connection management
-  useEffect(() => {
-    const wsManager = wsManagerRef.current;
-    let mounted = true;
+  // ✅ toggle indicator
+  const toggleIndicator = useCallback((k) => {
+    setIndicators((p) => ({ ...p, [k]: !p[k] }));
+  }, []);
 
-    const handleMessage = async (event) => {
-      if (!mounted) return;
+  // ✅ run analysis: حد أدنى 15 شمعة + fallback سريع
+  const runAnalysis = useCallback(
+    async (source = "manual") => {
+      const candles = candlesRef.current;
+      if (!candles || candles.length < 15) {
+        setAnalysis({
+          dir: "—",
+          conf: 0,
+          ok: false,
+          market: "انتظر...",
+          short: "قيد جمع البيانات…",
+          reasons: [`عدد الشموع الحالي: ${candles?.length || 0} (نحتاج 15 على الأقل)`]
+        });
+        return;
+      }
+
+      const closes = candles.map((c) => c.close);
+      const highs = candles.map((c) => c.high);
+      const lows = candles.map((c) => c.low);
+      const volumes = candles.map((c) => c.volume || 0);
+
+      // ✅ تحليل سريع دائمًا (حتى قبل اكتمال كل المؤشرات)
+      const last = closes[closes.length - 1];
+      const prev = closes[closes.length - 2];
+      const delta = last - prev;
+
+      let buySignals = 0;
+      let sellSignals = 0;
+      const reasons = [];
+
+      if (delta > 0) {
+        buySignals += 1;
+        reasons.push("السعر أعلى من الإغلاق السابق (زخم صعودي سريع)");
+      } else if (delta < 0) {
+        sellSignals += 1;
+        reasons.push("السعر أقل من الإغلاق السابق (زخم هبوطي سريع)");
+      }
+
+      // market volatility
+      const recent = closes.slice(-20);
+      const vol = avg(recent) ? stdDev(recent) / avg(recent) : 0;
+      const market = vol > 0.02 ? "تذبذب عالي" : vol < 0.005 ? "هادئ" : "طبيعي";
 
       try {
+        const { RSI, EMA, MACD, BollingerBands, Stochastic, SMA } = await import(
+          "technicalindicators"
+        );
+
+        // ✅ RSI (needs 14)
+        if (indicators.RSI && closes.length >= 15) {
+          const rsi = RSI.calculate({ values: closes, period: 14 }).slice(-1)[0];
+          if (rsi < 30) {
+            buySignals += 2;
+            reasons.push("RSI تشبع بيع (شراء)");
+          } else if (rsi > 70) {
+            sellSignals += 2;
+            reasons.push("RSI تشبع شراء (بيع)");
+          } else if (rsi > 50) {
+            buySignals += 1;
+            reasons.push("RSI فوق 50 (ميل صعودي)");
+          } else {
+            sellSignals += 1;
+            reasons.push("RSI تحت 50 (ميل هبوطي)");
+          }
+        }
+
+        // ✅ EMA
+        if (indicators.EMA && closes.length >= 25) {
+          const ema9 = EMA.calculate({ values: closes, period: 9 }).slice(-1)[0];
+          const ema21 = EMA.calculate({ values: closes, period: 21 }).slice(-1)[0];
+          if (ema9 > ema21) {
+            buySignals += 2;
+            reasons.push("EMA9 فوق EMA21 (ترند صاعد)");
+          } else {
+            sellSignals += 2;
+            reasons.push("EMA9 تحت EMA21 (ترند هابط)");
+          }
+        }
+
+        // ✅ MACD
+        if (indicators.MACD && closes.length >= 35) {
+          const macdArr = MACD.calculate({
+            values: closes,
+            fastPeriod: 12,
+            slowPeriod: 26,
+            signalPeriod: 9,
+            SimpleMAOscillator: false,
+            SimpleMASignal: false
+          });
+          const m = macdArr.slice(-1)[0];
+          if (m && m.MACD > m.signal) {
+            buySignals += 1;
+            reasons.push("MACD إيجابي");
+          } else if (m) {
+            sellSignals += 1;
+            reasons.push("MACD سلبي");
+          }
+        }
+
+        // ✅ Bollinger
+        if (indicators.BB && closes.length >= 25) {
+          const bb = BollingerBands.calculate({ values: closes, period: 20, stdDev: 2 }).slice(
+            -1
+          )[0];
+          if (bb) {
+            if (last < bb.lower) {
+              buySignals += 2;
+              reasons.push("بولنجر: تحت النطاق السفلي (شراء)");
+            } else if (last > bb.upper) {
+              sellSignals += 2;
+              reasons.push("بولنجر: فوق النطاق العلوي (بيع)");
+            }
+          }
+        }
+
+        // ✅ Stochastic
+        if (indicators.Stochastic && closes.length >= 20) {
+          const st = Stochastic.calculate({
+            high: highs,
+            low: lows,
+            close: closes,
+            period: 14,
+            signalPeriod: 3
+          }).slice(-1)[0];
+          if (st) {
+            if (st.k < 20 && st.d < 20) {
+              buySignals += 1;
+              reasons.push("ستوكاستك: تشبع بيع");
+            } else if (st.k > 80 && st.d > 80) {
+              sellSignals += 1;
+              reasons.push("ستوكاستك: تشبع شراء");
+            }
+          }
+        }
+
+        // ✅ Volume confirm
+        if (indicators.Volume && volumes.length >= 25) {
+          const vSMA = SMA.calculate({ values: volumes, period: 20 }).slice(-1)[0];
+          const vLast = volumes[volumes.length - 1];
+          if (vSMA && vLast > vSMA * 1.4) {
+            reasons.push("حجم عالي (تأكيد محتمل)");
+            if (buySignals > sellSignals) buySignals += 1;
+            else if (sellSignals > buySignals) sellSignals += 1;
+          }
+        }
+      } catch {
+        // technicalindicators may fail build/runtime, keep quick analysis only
+        reasons.push("تنبيه: تعذّر تحميل بعض المؤشرات (استخدمنا تحليل سريع)");
+      }
+
+      // ✅ كل دقيقة: خلي النتيجة واضحة ومختصرة
+      const total = buySignals + sellSignals;
+      const conf = total ? Math.round((Math.max(buySignals, sellSignals) / total) * 100) : 0;
+
+      const dir =
+        buySignals > sellSignals ? "صعود 📈" : sellSignals > buySignals ? "هبوط 📉" : "محايد ➖";
+
+      // ✅ صلاحية الإشارة
+      const ok = conf >= 60 && Math.abs(buySignals - sellSignals) >= 2;
+
+      const short =
+        dir === "محايد ➖"
+          ? "لا توجد أفضلية واضحة الآن"
+          : dir.includes("صعود")
+          ? `توصية: صعود لمدة ${Math.min(60, durationSec)} ثانية (إذا تحب دخول سريع)`
+          : `توصية: هبوط لمدة ${Math.min(60, durationSec)} ثانية (إذا تحب دخول سريع)`;
+
+      setAnalysis({
+        dir,
+        conf,
+        ok,
+        market,
+        short,
+        reasons: reasons.slice(0, 8)
+      });
+
+      // ✅ سجل + تنبيه
+      if (ok && (source === "timer_1m" || source === "new_candle" || source === "manual")) {
+        const entry = {
+          timestamp: Date.now(),
+          asset,
+          durationSec,
+          direction: dir,
+          confidence: conf,
+          isValid: ok
+        };
+        const newHist = [entry, ...history].slice(0, 100);
+        setHistory(newHist);
+        try {
+          localStorage.setItem(LS_HIST, JSON.stringify(newHist));
+        } catch {}
+
+        if (alertOn && conf >= alertMinConf) {
+          const now = Date.now();
+          if (now - lastAlertRef.current.time > 30_000) {
+            playAlert(dir.includes("صعود") ? "buy" : "sell");
+            lastAlertRef.current = { time: now, type: dir };
+            setNotification({ type: "info", message: `إشارة ${dir} (${conf}%)`, timestamp: now });
+          }
+        }
+      }
+    },
+    [asset, durationSec, indicators, history, alertOn, alertMinConf]
+  );
+
+  // WebSocket
+  useEffect(() => {
+    const ws = wsManagerRef.current;
+    let mounted = true;
+
+    const onMessage = async (event) => {
+      if (!mounted) return;
+      try {
         const data = JSON.parse(event.data);
-        
-        // Handle history candles
+
+        // candles history
         if (data.candles && Array.isArray(data.candles)) {
-          const candlesData = data.candles.map(candle => ({
-            time: Number(candle.epoch),
-            open: Number(candle.open),
-            high: Number(candle.high),
-            low: Number(candle.low),
-            close: Number(candle.close),
-            volume: Number(candle.volume) || 0
-          })).filter(c => 
-            isFinite(c.time) && 
-            isFinite(c.open) && 
-            isFinite(c.high) && 
-            isFinite(c.low) && 
-            isFinite(c.close)
-          );
+          const candlesData = data.candles
+            .map((c) => ({
+              time: Number(c.epoch),
+              open: Number(c.open),
+              high: Number(c.high),
+              low: Number(c.low),
+              close: Number(c.close),
+              volume: Number(c.volume) || 0
+            }))
+            .filter((c) => isFinite(c.time) && isFinite(c.open) && isFinite(c.high) && isFinite(c.low) && isFinite(c.close))
+            .slice(-200);
 
-          candlesRef.current = candlesData.slice(-200);
-          lastCandleRef.current = candlesRef.current[candlesRef.current.length - 1] || null;
+          candlesRef.current = candlesData;
+          lastCandleRef.current = candlesData[candlesData.length - 1] || null;
 
-          // Update chart
-          if (seriesRef.current) {
-            seriesRef.current.setData(candlesRef.current);
+          if (candleSeriesRef.current) candleSeriesRef.current.setData(candlesData);
+
+          // ✅ update volume chart
+          if (volumeSeriesRef.current) {
+            const volData = candlesData.map((c) => ({
+              time: c.time,
+              value: c.volume || 0,
+              color: c.close >= c.open ? theme.green : theme.red
+            }));
+            volumeSeriesRef.current.setData(volData);
           }
 
-          // Run initial analysis
-          await runAnalysis("history");
+          updateSRLines();
           setIsLoading(false);
+
+          // تحليل مباشر بعد استلام التاريخ
+          runAnalysis("history");
           return;
         }
 
-        // Handle live ticks
+        // ticks live
         if (data.tick) {
           const epoch = Math.floor(data.tick.epoch);
           const newPrice = Number(data.tick.quote);
-          
           if (!isFinite(newPrice)) return;
 
           setPrice(newPrice.toFixed(5));
 
           const candleStart = bucketStart(epoch, durationSec);
-          let currentCandle = lastCandleRef.current;
+          let current = lastCandleRef.current;
 
-          if (!currentCandle || currentCandle.time !== candleStart) {
-            // Close previous candle and start new one
-            if (currentCandle) {
-              candlesRef.current = [...candlesRef.current, currentCandle].slice(-200);
+          if (!current || current.time !== candleStart) {
+            if (current) {
+              candlesRef.current = [...candlesRef.current, current].slice(-200);
             }
 
             const newCandle = {
@@ -512,484 +650,119 @@ export default function Home() {
             };
 
             lastCandleRef.current = newCandle;
-            
-            if (seriesRef.current) {
-              seriesRef.current.update(newCandle);
+
+            if (candleSeriesRef.current) candleSeriesRef.current.update(newCandle);
+
+            // ✅ volume update per candle
+            if (volumeSeriesRef.current) {
+              volumeSeriesRef.current.update({
+                time: candleStart,
+                value: 1,
+                color: theme.green
+              });
             }
 
-            await runAnalysis("new_candle");
+            updateSRLines();
+            runAnalysis("new_candle");
           } else {
-            // Update current candle
-            const updatedCandle = {
-              ...currentCandle,
-              high: Math.max(currentCandle.high, newPrice),
-              low: Math.min(currentCandle.low, newPrice),
+            const updated = {
+              ...current,
+              high: Math.max(current.high, newPrice),
+              low: Math.min(current.low, newPrice),
               close: newPrice,
-              volume: currentCandle.volume + 1
+              volume: (current.volume || 0) + 1
             };
 
-            lastCandleRef.current = updatedCandle;
-            
-            if (seriesRef.current) {
-              seriesRef.current.update(updatedCandle);
+            lastCandleRef.current = updated;
+            if (candleSeriesRef.current) candleSeriesRef.current.update(updated);
+
+            if (volumeSeriesRef.current) {
+              volumeSeriesRef.current.update({
+                time: updated.time,
+                value: updated.volume || 0,
+                color: updated.close >= updated.open ? theme.green : theme.red
+              });
             }
 
-            // Run analysis every few seconds
-            if (epoch % 3 === 0) {
-              await runAnalysis("tick");
-            }
+            // ✅ تحليل خفيف كل 15 ثانية (حتى يصير واضح ومتجدد)
+            if (epoch % 15 === 0) runAnalysis("tick_15s");
           }
         }
 
-        // Handle error responses
         if (data.error) {
-          console.error("Deriv API error:", data.error);
           setNotification({
             type: "error",
-            message: `API Error: ${data.error.message || "Unknown error"}`,
+            message: `Deriv: ${data.error.message || "خطأ"}`,
             timestamp: Date.now()
           });
+          setIsLoading(false);
         }
-
-      } catch (error) {
-        console.error("Error processing WebSocket message:", error);
-      }
+      } catch {}
     };
 
-    const handleOpen = () => {
+    const onOpen = () => {
       if (!mounted) return;
       setConnectionStatus("connected");
-      setNotification({
-        type: "success",
-        message: "Connected to Deriv WebSocket",
-        timestamp: Date.now()
-      });
+      setNotification({ type: "success", message: "✅ تم الاتصال بالسيرفر", timestamp: Date.now() });
 
-      // Subscribe to asset
-      wsManager.subscribe(asset);
-      
-      // Request history
+      ws.subscribeTicks(asset);
       setIsLoading(true);
-      wsManager.requestHistory(asset, durationSec, 200);
+      ws.requestHistoryCandles(asset, durationSec, 200);
     };
 
-    const handleClose = () => {
-      if (!mounted) return;
-      setConnectionStatus("disconnected");
-    };
+    const onClose = () => mounted && setConnectionStatus("disconnected");
+    const onError = () => mounted && setConnectionStatus("error");
 
-    const handleError = (error) => {
-      if (!mounted) return;
-      setConnectionStatus("error");
-      console.error("WebSocket error:", error);
-    };
+    setConnectionStatus("connecting");
+    ws.connect(onMessage, onOpen, onClose, onError);
 
-    // Connect WebSocket
-    wsManager.connect(handleMessage, handleOpen, handleClose, handleError);
-
-    // Cleanup
     return () => {
       mounted = false;
-      wsManager.disconnect();
+      ws.disconnect();
     };
-  }, [asset, durationSec]);
+  }, [asset, durationSec, theme.green, theme.red, updateSRLines, runAnalysis]);
 
-  // Enhanced analysis function
-  const runAnalysis = useCallback(async (source = "manual") => {
-    const candles = candlesRef.current;
-    if (!candles || candles.length < 40) {
-      setAnalysis(prev => ({
-        ...prev,
-        market: "انتظر تجمع بيانات...",
-        reasons: ["أقل من 40 شمعة للتحليل الدقيق"]
-      }));
-      return;
-    }
-
-    try {
-      const { RSI, EMA, MACD, BollingerBands, Stochastic, SMA } = await import("technicalindicators");
-      
-      const closes = candles.map(c => c.close);
-      const highs = candles.map(c => c.high);
-      const lows = candles.map(c => c.low);
-      const volumes = candles.map(c => c.volume || 0);
-
-      let rsi = null, ema9 = null, ema21 = null, macd = null;
-      let bb = null, stochastic = null, volumeSMA = null;
-
-      // Calculate RSI
-      if (indicators.RSI) {
-        const rsiValues = RSI.calculate({ values: closes, period: 14 });
-        rsi = rsiValues[rsiValues.length - 1];
-      }
-
-      // Calculate EMAs
-      if (indicators.EMA) {
-        const ema9Values = EMA.calculate({ values: closes, period: 9 });
-        const ema21Values = EMA.calculate({ values: closes, period: 21 });
-        ema9 = ema9Values[ema9Values.length - 1];
-        ema21 = ema21Values[ema21Values.length - 1];
-      }
-
-      // Calculate MACD
-      if (indicators.MACD) {
-        const macdValues = MACD.calculate({
-          values: closes,
-          fastPeriod: 12,
-          slowPeriod: 26,
-          signalPeriod: 9,
-          SimpleMAOscillator: false,
-          SimpleMASignal: false
-        });
-        macd = macdValues[macdValues.length - 1];
-      }
-
-      // Calculate Bollinger Bands
-      if (indicators.BB) {
-        const bbValues = BollingerBands.calculate({
-          values: closes,
-          period: 20,
-          stdDev: 2
-        });
-        bb = bbValues[bbValues.length - 1];
-      }
-
-      // Calculate Stochastic
-      if (indicators.Stochastic) {
-        const stochValues = Stochastic.calculate({
-          high: highs,
-          low: lows,
-          close: closes,
-          period: 14,
-          signalPeriod: 3
-        });
-        stochastic = stochValues[stochValues.length - 1];
-      }
-
-      // Calculate Volume SMA
-      if (indicators.Volume && volumes.length > 0) {
-        const volumeSMAValues = SMA.calculate({
-          values: volumes,
-          period: 20
-        });
-        volumeSMA = volumeSMAValues[volumeSMAValues.length - 1];
-      }
-
-      // Analyze signals
-      const reasons = [];
-      let buySignals = 0;
-      let sellSignals = 0;
-      const totalSignals = 0;
-
-      // RSI Analysis
-      if (rsi !== null) {
-        if (rsi < 30) {
-          reasons.push("RSI: تشبع بيع (إشارة شراء قوية)");
-          buySignals += 2;
-        } else if (rsi > 70) {
-          reasons.push("RSI: تشبع شراء (إشارة بيع قوية)");
-          sellSignals += 2;
-        } else if (rsi > 50) {
-          reasons.push("RSI: اتجاه صعودي");
-          buySignals += 1;
-        } else {
-          reasons.push("RSI: اتجاه هبوطي");
-          sellSignals += 1;
-        }
-      }
-
-      // EMA Analysis
-      if (ema9 !== null && ema21 !== null) {
-        if (ema9 > ema21) {
-          reasons.push("المتوسطات: EMA9 فوق EMA21 (صعودي)");
-          buySignals += 2;
-        } else {
-          reasons.push("المتوسطات: EMA9 تحت EMA21 (هبوطي)");
-          sellSignals += 2;
-        }
-      }
-
-      // MACD Analysis
-      if (macd !== null) {
-        if (macd.MACD > macd.signal) {
-          reasons.push("MACD: إيجابي (صعودي)");
-          buySignals += 1;
-        } else {
-          reasons.push("MACD: سلبي (هبوطي)");
-          sellSignals += 1;
-        }
-      }
-
-      // Bollinger Bands Analysis
-      if (bb !== null && closes.length > 0) {
-        const lastClose = closes[closes.length - 1];
-        if (lastClose < bb.lower) {
-          reasons.push("بولنجر: السعر تحت النطاق السفلي (تشبع بيع)");
-          buySignals += 2;
-        } else if (lastClose > bb.upper) {
-          reasons.push("بولنجر: السعر فوق النطاق العلوي (تشبع شراء)");
-          sellSignals += 2;
-        }
-      }
-
-      // Stochastic Analysis
-      if (stochastic !== null) {
-        if (stochastic.k < 20 && stochastic.d < 20) {
-          reasons.push("ستوكاستك: تشبع بيع");
-          buySignals += 1;
-        } else if (stochastic.k > 80 && stochastic.d > 80) {
-          reasons.push("ستوكاستك: تشبع شراء");
-          sellSignals += 1;
-        }
-      }
-
-      // Volume Analysis
-      if (volumeSMA !== null && volumes.length > 0) {
-        const lastVolume = volumes[volumes.length - 1];
-        if (lastVolume > volumeSMA * 1.5) {
-          reasons.push("الحجم: حجم تداول عالي (تأكيد اتجاه)");
-          if (buySignals > sellSignals) buySignals += 1;
-          else if (sellSignals > buySignals) sellSignals += 1;
-        }
-      }
-
-      // Market volatility analysis
-      const recentCloses = closes.slice(-20);
-      const volatility = stdDev(recentCloses) / avg(recentCloses);
-      
-      let marketCondition = "طبيعي";
-      if (volatility > 0.02) {
-        marketCondition = "تذبذب عالي";
-        reasons.push("تحذير: تذبذب السوق عالي - كن حذراً");
-      } else if (volatility < 0.005) {
-        marketCondition = "هادئ";
-        reasons.push("السوق هادئ - إشارات أكثر دقة");
-      }
-
-      // Late entry warning
-      if (countdown <= Math.min(15, Math.floor(durationSec * 0.25))) {
-        reasons.unshift("⚠️ قرب إغلاق الشمعة - انتظر الشمعة الجديدة");
-        buySignals = Math.max(0, buySignals - 1);
-        sellSignals = Math.max(0, sellSignals - 1);
-      }
-
-      // Calculate confidence
-      const total = buySignals + sellSignals;
-      const confidence = total > 0 
-        ? Math.round((Math.max(buySignals, sellSignals) / total) * 100)
-        : 0;
-
-      const direction = buySignals > sellSignals ? "صعود 📈" : 
-                       sellSignals > buySignals ? "هبوط 📉" : "محايد ➖";
-
-      // Determine if signal is valid
-      const minConfidence = durationSec <= 30 ? 70 : 
-                           durationSec <= 60 ? 65 : 
-                           durationSec <= 180 ? 60 : 55;
-      
-      const isValid = confidence >= minConfidence && 
-                      Math.abs(buySignals - sellSignals) >= 2 &&
-                      countdown > 10;
-
-      // Strategy scores
-      const strategyScores = {
-        trend: ema9 > ema21 ? 80 : 20,
-        reversal: rsi && (rsi < 30 || rsi > 70) ? 75 : 40,
-        range: bb ? 60 : 50,
-        breakout: volatility > 0.015 ? 70 : 30
-      };
-
-      const analysisResult = {
-        dir: direction,
-        conf: confidence,
-        ok: isValid,
-        market: marketCondition,
-        reasons: reasons.slice(0, 8),
-        strategies: strategyScores,
-        signals: {
-          rsi,
-          macd: macd ? { value: macd.MACD, signal: macd.signal } : null,
-          bb,
-          stochastic,
-          volume: volumes.length > 0 ? volumes[volumes.length - 1] : null
-        }
-      };
-
-      setAnalysis(analysisResult);
-
-      // Save to history if valid signal
-      if (isValid && (source === "new_candle" || source === "history")) {
-        const historyEntry = {
-          timestamp: Date.now(),
-          asset,
-          durationSec,
-          direction,
-          confidence,
-          isValid,
-          price: closes[closes.length - 1],
-          signals: { buySignals, sellSignals }
-        };
-
-        const newHistory = [historyEntry, ...history].slice(0, 100);
-        setHistory(newHistory);
-        
-        try {
-          localStorage.setItem(LS_HIST, JSON.stringify(newHistory));
-        } catch (error) {
-          console.error("Failed to save history:", error);
-        }
-
-        // Trigger alert
-        if (alertOn && confidence >= alertMinConf) {
-          const now = Date.now();
-          if (now - lastAlertRef.current.time > 30000) { // 30 seconds cooldown
-            playAlert(buySignals > sellSignals ? "buy" : "sell");
-            lastAlertRef.current = { time: now, type: direction };
-            
-            // Show notification
-            setNotification({
-              type: "info",
-              message: `إشارة ${direction} بقوة ${confidence}%`,
-              timestamp: now
-            });
-          }
-        }
-      }
-
-    } catch (error) {
-      console.error("Analysis failed:", error);
-      setNotification({
-        type: "error",
-        message: "فشل التحليل الفني",
-        timestamp: Date.now()
-      });
-    }
-  }, [asset, durationSec, countdown, indicators, alertOn, alertMinConf, history]);
-
-  // Statistics calculation
-  const stats = useMemo(() => {
-    const validSignals = history.filter(h => h.isValid);
-    const total = validSignals.length;
-    
-    if (total === 0) {
-      return {
-        total: 0,
-        successRate: 0,
-        avgConfidence: 0,
-        bestAsset: "N/A",
-        bestDuration: "N/A"
-      };
-    }
-
-    const buySignals = validSignals.filter(h => h.direction.includes("صعود")).length;
-    const sellSignals = validSignals.filter(h => h.direction.includes("هبوط")).length;
-    const avgConfidence = Math.round(validSignals.reduce((sum, h) => sum + h.confidence, 0) / total);
-    
-    // Find best performing asset
-    const assetPerformance = {};
-    validSignals.forEach(signal => {
-      const key = signal.asset;
-      assetPerformance[key] = (assetPerformance[key] || 0) + (signal.isValid ? 1 : 0);
-    });
-
-    const bestAsset = Object.entries(assetPerformance)
-      .sort(([,a], [,b]) => b - a)[0]?.[0] || "N/A";
-
-    return {
-      total,
-      buySignals,
-      sellSignals,
-      successRate: Math.round((validSignals.length / history.length) * 100) || 0,
-      avgConfidence,
-      bestAsset,
-      bestDuration: `${durationSec}s`
-    };
-  }, [history, durationSec]);
-
-  // Clear history
   const clearHistory = useCallback(() => {
-    if (window.confirm("هل أنت متأكد من مسح سجل التحليلات؟")) {
-      setHistory([]);
-      try {
-        localStorage.removeItem(LS_HIST);
-        setNotification({
-          type: "success",
-          message: "تم مسح السجل بنجاح",
-          timestamp: Date.now()
-        });
-      } catch (error) {
-        console.error("Failed to clear history:", error);
-      }
-    }
+    if (!window.confirm("تمسح السجل؟")) return;
+    setHistory([]);
+    try { localStorage.removeItem(LS_HIST); } catch {}
   }, []);
 
-  // Reset all settings
-  const resetSettings = useCallback(() => {
-    if (window.confirm("هل تريد استعادة الإعدادات الافتراضية؟")) {
-      setDark(false);
-      setAsset(ASSETS[0].symbol);
-      setDurationSec(60);
-      setRisk("متوسط");
-      setAlertOn(true);
-      setAlertMinConf(72);
-      setIndicators({
-        RSI: true,
-        EMA: true,
-        MACD: true,
-        BB: false,
-        Stochastic: false,
-        Volume: false
-      });
-      
-      setNotification({
-        type: "success",
-        message: "تم استعادة الإعدادات الافتراضية",
-        timestamp: Date.now()
-      });
-    }
-  }, []);
+  const fullscreenToggle = useCallback(() => setIsFull((v) => !v), []);
 
-  // Toggle indicator
-  const toggleIndicator = useCallback((indicator) => {
-    setIndicators(prev => ({
-      ...prev,
-      [indicator]: !prev[indicator]
-    }));
-  }, []);
-
-  // Render function
   return (
-    <div style={{
-      background: theme.bg,
-      color: theme.fg,
-      minHeight: "100vh",
-      direction: "rtl",
-      fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif",
-      transition: "background 0.3s, color 0.3s"
-    }}>
-      {/* Notification */}
+    <div
+      style={{
+        background: theme.bg,
+        color: theme.fg,
+        minHeight: "100vh",
+        direction: "rtl",
+        fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif"
+      }}
+    >
       {notification && (
-        <div style={{
-          position: "fixed",
-          top: 20,
-          right: 20,
-          left: 20,
-          maxWidth: 400,
-          margin: "0 auto",
-          padding: "12px 16px",
-          borderRadius: 12,
-          background: notification.type === "error" ? theme.red : 
-                     notification.type === "success" ? theme.green : theme.blue,
-          color: "white",
-          zIndex: 1000,
-          boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
-          animation: "slideDown 0.3s ease"
-        }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span>{notification.message}</span>
-            <button 
+        <div
+          style={{
+            position: "fixed",
+            top: 20,
+            right: 20,
+            left: 20,
+            maxWidth: 440,
+            margin: "0 auto",
+            padding: "12px 16px",
+            borderRadius: 12,
+            background:
+              notification.type === "error" ? theme.red : notification.type === "success" ? theme.green : theme.blue,
+            color: "white",
+            zIndex: 1000,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.15)"
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+            <div>{notification.message}</div>
+            <button
               onClick={() => setNotification(null)}
-              style={{ background: "none", border: "none", color: "white", cursor: "pointer" }}
+              style={{ background: "transparent", border: "none", color: "white", cursor: "pointer" }}
             >
               ✕
             </button>
@@ -997,562 +770,252 @@ export default function Home() {
         </div>
       )}
 
-      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "20px" }}>
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: 20 }}>
         {/* Header */}
-        <header style={{ marginBottom: 24 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16 }}>
-            <div>
-              <h1 style={{ fontSize: 28, fontWeight: 800, margin: 0, color: theme.blue }}>
-                📈 Deriv Pro Analyzer
-              </h1>
-              <p style={{ margin: "4px 0 0", opacity: 0.8, fontSize: 14 }}>
-                تحليل فني متقدم للأسواق المالية - Deriv API
-              </p>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <h1 style={{ margin: 0, color: theme.blue }}>📈 Deriv Pro Analyzer</h1>
+            <div style={{ opacity: 0.8, fontSize: 13 }}>تحليل واضح + شموع + دعم/مقاومة + Volume + Fullscreen</div>
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span
+              style={{
+                padding: "6px 10px",
+                borderRadius: 20,
+                color: "white",
+                background:
+                  connectionStatus === "connected" ? theme.green : connectionStatus === "connecting" ? "#fbbf24" : theme.red,
+                fontSize: 12
+              }}
+            >
+              {connectionStatus === "connected" ? "متصل ✓" : connectionStatus === "connecting" ? "جاري الاتصال..." : "غير متصل ✗"}
+            </span>
+
+            <button
+              onClick={() => setDark((v) => !v)}
+              style={{ padding: "8px 14px", borderRadius: 10, border: `1px solid ${theme.border}`, background: theme.card, color: theme.fg, cursor: "pointer" }}
+            >
+              {dark ? "☀️ نهاري" : "🌙 ليلي"}
+            </button>
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div style={{ background: theme.card, borderRadius: 16, padding: 16, border: `1px solid ${theme.border}`, marginTop: 16 }}>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>الأصل</div>
+              <select
+                value={asset}
+                onChange={(e) => setAsset(e.target.value)}
+                style={{ width: "100%", padding: 10, borderRadius: 10, border: `1px solid ${theme.border}`, background: theme.soft, color: theme.fg }}
+              >
+                {ASSETS.map((a) => (
+                  <option key={a.symbol} value={a.symbol}>
+                    {a.label}
+                  </option>
+                ))}
+              </select>
             </div>
 
-            <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-              <div style={{
-                padding: "6px 12px",
-                borderRadius: 20,
-                background: connectionStatus === "connected" ? theme.green : 
-                          connectionStatus === "connecting" ? "#fbbf24" : theme.red,
-                color: "white",
-                fontSize: 12,
-                fontWeight: 600
-              }}>
-                {connectionStatus === "connected" ? "متصل ✓" :
-                 connectionStatus === "connecting" ? "جاري الاتصال..." : "غير متصل ✗"}
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>المدة</div>
+              <select
+                value={durationSec}
+                onChange={(e) => setDurationSec(Number(e.target.value))}
+                style={{ width: "100%", padding: 10, borderRadius: 10, border: `1px solid ${theme.border}`, background: theme.soft, color: theme.fg }}
+              >
+                {DURATIONS.map((d) => (
+                  <option key={d.sec} value={d.sec}>
+                    {d.label}
+                  </option>
+                ))}
+              </select>
+              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                ملاحظة: للـ 10s/30s التاريخ يستخدم 1 دقيقة تلقائيًا حتى ما يصير خطأ.
               </div>
+            </div>
+
+            <div style={{ flex: 1, minWidth: 220, display: "flex", gap: 10 }}>
+              <div style={{ flex: 1, padding: 12, borderRadius: 12, background: theme.soft, border: `1px solid ${theme.border}` }}>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>السعر</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: theme.blue }}>{price}</div>
+              </div>
+              <div style={{ padding: 12, borderRadius: 12, background: countdown <= 10 ? theme.red : theme.soft, border: `1px solid ${theme.border}`, minWidth: 110 }}>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>باقي</div>
+                <div style={{ fontSize: 18, fontWeight: 800 }}>{countdown}s</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Indicators */}
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontWeight: 700, marginBottom: 10 }}>الخيارات</div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {Object.entries(indicators).map(([k, v]) => (
+                <button
+                  key={k}
+                  onClick={() => toggleIndicator(k)}
+                  style={{
+                    padding: "8px 14px",
+                    borderRadius: 20,
+                    border: `1px solid ${v ? theme.blue : theme.border}`,
+                    background: v ? theme.blue : theme.soft,
+                    color: v ? "white" : theme.fg,
+                    cursor: "pointer",
+                    fontSize: 13
+                  }}
+                >
+                  {v ? "✓ " : ""}{k}
+                </button>
+              ))}
 
               <button
-                onClick={() => setDark(!dark)}
+                onClick={fullscreenToggle}
                 style={{
-                  padding: "8px 16px",
-                  borderRadius: 10,
+                  padding: "8px 14px",
+                  borderRadius: 20,
                   border: `1px solid ${theme.border}`,
                   background: theme.card,
                   color: theme.fg,
                   cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8
+                  fontSize: 13
                 }}
               >
-                {dark ? "☀️ وضع نهاري" : "🌙 وضع ليلي"}
+                {isFull ? "🗗 خروج من التكبير" : "🗖 تكبير الشارت"}
               </button>
 
-              <select
-                value={risk}
-                onChange={(e) => setRisk(e.target.value)}
-                style={{
-                  padding: "8px 16px",
-                  borderRadius: 10,
-                  border: `1px solid ${theme.border}`,
-                  background: theme.card,
-                  color: theme.fg,
-                  cursor: "pointer"
-                }}
-              >
-                <option value="منخفض">🔵 مخاطرة منخفضة</option>
-                <option value="متوسط">🟡 مخاطرة متوسطة</option>
-                <option value="عالي">🔴 مخاطرة عالية</option>
-              </select>
-            </div>
-          </div>
-        </header>
-
-        {/* Main Controls */}
-        <div style={{
-          background: theme.card,
-          borderRadius: 16,
-          padding: 20,
-          marginBottom: 20,
-          border: `1px solid ${theme.border}`,
-          boxShadow: dark ? "0 4px 20px rgba(0,0,0,0.2)" : "0 2px 12px rgba(0,0,0,0.05)"
-        }}>
-          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 20 }}>
-            {/* Asset Selection */}
-            <div style={{ flex: 1, minWidth: 200 }}>
-              <label style={{ display: "block", marginBottom: 8, fontWeight: 600 }}>الأصل:</label>
-              <select
-                value={asset}
-                onChange={(e) => setAsset(e.target.value)}
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: `1px solid ${theme.border}`,
-                  background: theme.soft,
-                  color: theme.fg,
-                  fontSize: 14
-                }}
-              >
-                {ASSETS.map(a => (
-                  <option key={a.symbol} value={a.symbol}>{a.label}</option>
-                ))}
-              </select>
-            </div>
-
-            {/* Duration Selection */}
-            <div style={{ flex: 1, minWidth: 200 }}>
-              <label style={{ display: "block", marginBottom: 8, fontWeight: 600 }}>المدة:</label>
-              <select
-                value={durationSec}
-                onChange={(e) => setDurationSec(Number(e.target.value))}
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: `1px solid ${theme.border}`,
-                  background: theme.soft,
-                  color: theme.fg,
-                  fontSize: 14
-                }}
-              >
-                {DURATIONS.map(d => (
-                  <option key={d.sec} value={d.sec}>{d.label}</option>
-                ))}
-              </select>
-            </div>
-
-            {/* Live Data */}
-            <div style={{ flex: 1, minWidth: 200 }}>
-              <div style={{ display: "flex", gap: 12, height: "100%", alignItems: "flex-end" }}>
-                <div style={{
-                  flex: 1,
-                  padding: "12px 16px",
-                  borderRadius: 12,
-                  background: theme.soft,
-                  border: `1px solid ${theme.border}`
-                }}>
-                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 4 }}>السعر الحالي</div>
-                  <div style={{ fontSize: 24, fontWeight: 700, color: theme.blue }}>{price}</div>
-                </div>
-                
-                <div style={{
-                  padding: "12px 16px",
-                  borderRadius: 12,
-                  background: countdown <= 10 ? theme.red : theme.soft,
-                  border: `1px solid ${theme.border}`,
-                  minWidth: 100
-                }}>
-                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 4 }}>باقي على الإغلاق</div>
-                  <div style={{ fontSize: 20, fontWeight: 700 }}>{countdown}s</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Indicators Toggle */}
-          <div style={{ marginBottom: 20 }}>
-            <h3 style={{ marginBottom: 12, fontSize: 16, fontWeight: 600 }}>المؤشرات الفنية:</h3>
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-              {Object.entries(indicators).map(([key, value]) => (
-                <button
-                  key={key}
-                  onClick={() => toggleIndicator(key)}
-                  style={{
-                    padding: "8px 16px",
-                    borderRadius: 20,
-                    border: `1px solid ${value ? theme.blue : theme.border}`,
-                    background: value ? theme.blue : theme.soft,
-                    color: value ? "white" : theme.fg,
-                    cursor: "pointer",
-                    fontSize: 14,
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 6
-                  }}
-                >
-                  {value ? "✓ " : ""}{key}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Alert Settings */}
-          <div style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: 16,
-            paddingTop: 16,
-            borderTop: `1px solid ${theme.border}`
-          }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                <input
-                  type="checkbox"
-                  checked={alertOn}
-                  onChange={(e) => setAlertOn(e.target.checked)}
-                  style={{ width: 18, height: 18 }}
-                />
-                <span>التنبيهات الصوتية</span>
-              </label>
-
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span>عتبة التنبيه:</span>
-                <input
-                  type="range"
-                  min="50"
-                  max="95"
-                  value={alertMinConf}
-                  onChange={(e) => setAlertMinConf(Number(e.target.value))}
-                  style={{ width: 120 }}
-                />
-                <span style={{ minWidth: 40 }}>{alertMinConf}%</span>
-              </div>
-            </div>
-
-            <div style={{ display: "flex", gap: 8 }}>
               <button
                 onClick={() => runAnalysis("manual")}
                 disabled={isLoading}
                 style={{
-                  padding: "10px 20px",
-                  borderRadius: 10,
+                  padding: "8px 14px",
+                  borderRadius: 20,
                   border: "none",
-                  background: theme.blue,
+                  background: theme.green,
                   color: "white",
                   cursor: "pointer",
-                  fontWeight: 600,
-                  opacity: isLoading ? 0.6 : 1
+                  fontSize: 13,
+                  opacity: isLoading ? 0.7 : 1
                 }}
               >
-                {isLoading ? "جاري التحليل..." : "تشغيل تحليل فوري"}
+                {isLoading ? "تحميل..." : "تحليل الآن"}
               </button>
 
               <button
-                onClick={resetSettings}
+                onClick={clearHistory}
                 style={{
-                  padding: "10px 20px",
-                  borderRadius: 10,
+                  padding: "8px 14px",
+                  borderRadius: 20,
                   border: `1px solid ${theme.border}`,
                   background: "transparent",
                   color: theme.fg,
-                  cursor: "pointer"
+                  cursor: "pointer",
+                  fontSize: 13
                 }}
               >
-                إعادة تعيين
+                🗑️ مسح السجل
               </button>
             </div>
           </div>
-        </div>
 
-        {/* Chart Container */}
-        <div style={{
-          background: theme.card,
-          borderRadius: 16,
-          padding: 20,
-          marginBottom: 20,
-          border: `1px solid ${theme.border}`,
-          boxShadow: dark ? "0 4px 20px rgba(0,0,0,0.2)" : "0 2px 12px rgba(0,0,0,0.05)"
-        }}>
-          <div style={{ marginBottom: 16 }}>
-            <h2 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>الرسم البياني</h2>
-            <p style={{ margin: "4px 0 0", fontSize: 14, opacity: 0.7 }}>
-              {asset} - {DURATIONS.find(d => d.sec === durationSec)?.label}
-            </p>
+          {/* Alerts */}
+          <div style={{ marginTop: 12, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input type="checkbox" checked={alertOn} onChange={(e) => setAlertOn(e.target.checked)} />
+              <span>تنبيهات صوتية</span>
+            </label>
+
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <span>عتبة:</span>
+              <input type="range" min="50" max="95" value={alertMinConf} onChange={(e) => setAlertMinConf(Number(e.target.value))} />
+              <b>{alertMinConf}%</b>
+            </div>
           </div>
-          <div 
-            ref={containerRef}
-            style={{ 
-              width: "100%", 
-              height: 400,
-              borderRadius: 8,
-              overflow: "hidden"
-            }}
-          />
         </div>
 
-        {/* Analysis Results */}
-        <div style={{
-          background: theme.card,
-          borderRadius: 16,
-          padding: 20,
-          marginBottom: 20,
-          border: `1px solid ${theme.border}`,
-          boxShadow: dark ? "0 4px 20px rgba(0,0,0,0.2)" : "0 2px 12px rgba(0,0,0,0.05)"
-        }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-            <h2 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>نتائج التحليل</h2>
-            <div style={{
-              padding: "8px 16px",
-              borderRadius: 20,
-              background: analysis.ok ? theme.green : theme.red,
-              color: "white",
-              fontWeight: 600,
-              fontSize: 14
-            }}>
-              {analysis.ok ? "✅ إشارة قوية" : "❌ انتظر إشارة أفضل"}
+        {/* Chart */}
+        <div style={{ background: theme.card, borderRadius: 16, padding: 16, border: `1px solid ${theme.border}`, marginTop: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontWeight: 800, fontSize: 16 }}>الرسم البياني</div>
+              <div style={{ opacity: 0.7, fontSize: 13 }}>{asset} — {DURATIONS.find(d => d.sec === durationSec)?.label}</div>
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))", gap: 20, marginBottom: 24 }}>
-            {/* Direction */}
-            <div style={{
-              padding: 20,
-              borderRadius: 12,
-              background: theme.soft,
+          <div
+            style={{
+              marginTop: 12,
+              height: isFull ? 520 : 400,
+              borderRadius: 10,
+              overflow: "hidden",
               border: `1px solid ${theme.border}`
-            }}>
-              <div style={{ fontSize: 14, opacity: 0.8, marginBottom: 8 }}>الاتجاه المتوقع</div>
-              <div style={{ 
-                fontSize: 32, 
-                fontWeight: 800,
-                color: analysis.dir.includes("صعود") ? theme.green : 
-                      analysis.dir.includes("هبوط") ? theme.red : theme.fg
-              }}>
+            }}
+            ref={containerRef}
+          />
+          <div style={{ fontSize: 12, opacity: 0.65, marginTop: 8 }}>
+            * Volume يظهر أسفل الشارت + دعم/مقاومة خطوط تلقائية.
+          </div>
+        </div>
+
+        {/* Analysis */}
+        <div style={{ background: theme.card, borderRadius: 16, padding: 16, border: `1px solid ${theme.border}`, marginTop: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ fontWeight: 900, fontSize: 18 }}>نتائج التحليل</div>
+            <div style={{ padding: "6px 12px", borderRadius: 999, background: analysis.ok ? theme.green : theme.red, color: "white", fontWeight: 800 }}>
+              {analysis.ok ? "✅ إشارة واضحة" : "⏳ انتظر"}
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12, marginTop: 12 }}>
+            <div style={{ background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 14 }}>
+              <div style={{ opacity: 0.75 }}>الاتجاه</div>
+              <div style={{ fontSize: 28, fontWeight: 900, color: analysis.dir.includes("صعود") ? theme.green : analysis.dir.includes("هبوط") ? theme.red : theme.fg }}>
                 {analysis.dir}
               </div>
+              <div style={{ marginTop: 8, opacity: 0.85, fontWeight: 700 }}>{analysis.short}</div>
             </div>
 
-            {/* Confidence */}
-            <div style={{
-              padding: 20,
-              borderRadius: 12,
-              background: theme.soft,
-              border: `1px solid ${theme.border}`
-            }}>
-              <div style={{ fontSize: 14, opacity: 0.8, marginBottom: 8 }}>مستوى الثقة</div>
-              <div style={{ fontSize: 32, fontWeight: 800, color: theme.blue }}>
-                {analysis.conf}%
-              </div>
-              <div style={{
-                height: 8,
-                background: dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.1)",
-                borderRadius: 4,
-                marginTop: 12,
-                overflow: "hidden"
-              }}>
-                <div style={{
-                  width: `${analysis.conf}%`,
-                  height: "100%",
-                  background: `linear-gradient(90deg, ${theme.blue}, ${theme.green})`,
-                  borderRadius: 4
-                }} />
-              </div>
+            <div style={{ background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 14 }}>
+              <div style={{ opacity: 0.75 }}>الثقة</div>
+              <div style={{ fontSize: 28, fontWeight: 900, color: theme.blue }}>{analysis.conf}%</div>
+              <div style={{ marginTop: 8, opacity: 0.8 }}>حالة السوق: <b>{analysis.market}</b></div>
             </div>
 
-            {/* Market Condition */}
-            <div style={{
-              padding: 20,
-              borderRadius: 12,
-              background: theme.soft,
-              border: `1px solid ${theme.border}`
-            }}>
-              <div style={{ fontSize: 14, opacity: 0.8, marginBottom: 8 }}>حالة السوق</div>
-              <div style={{ fontSize: 24, fontWeight: 700 }}>
-                {analysis.market}
-              </div>
-              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
-                {analysis.market === "تذبذب عالي" ? "كن حذراً" : 
-                 analysis.market === "هادئ" ? "إشارات دقيقة" : "ظروف طبيعية"}
-              </div>
-            </div>
-          </div>
-
-          {/* Strategy Scores */}
-          <div style={{ marginBottom: 24 }}>
-            <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 16 }}>قوة الاستراتيجيات:</h3>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12 }}>
-              {Object.entries(analysis.strategies || {}).map(([name, score]) => (
-                <div key={name} style={{ marginBottom: 12 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-                    <span style={{ fontSize: 14 }}>{name}</span>
-                    <span style={{ fontWeight: 600 }}>{score}%</span>
-                  </div>
-                  <div style={{
-                    height: 8,
-                    background: dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.1)",
-                    borderRadius: 4,
-                    overflow: "hidden"
-                  }}>
-                    <div style={{
-                      width: `${score}%`,
-                      height: "100%",
-                      background: theme.blue,
-                      borderRadius: 4
-                    }} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Analysis Reasons */}
-          <div>
-            <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>أسباب التحليل:</h3>
-            <div style={{
-              background: theme.soft,
-              borderRadius: 12,
-              padding: 16,
-              border: `1px solid ${theme.border}`
-            }}>
-              <ul style={{ margin: 0, paddingRight: 20, lineHeight: 1.8 }}>
-                {analysis.reasons.map((reason, index) => (
-                  <li key={index} style={{ marginBottom: 8 }}>{reason}</li>
+            <div style={{ background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 14 }}>
+              <div style={{ opacity: 0.75, marginBottom: 8 }}>أسباب</div>
+              <ul style={{ margin: 0, paddingRight: 18, lineHeight: 1.7 }}>
+                {analysis.reasons?.slice(0, 6).map((r, i) => (
+                  <li key={i}>{r}</li>
                 ))}
               </ul>
             </div>
-            <div style={{ marginTop: 16, padding: 12, background: dark ? "rgba(239, 68, 68, 0.1)" : "#fef2f2", borderRadius: 8, border: `1px solid ${theme.red}` }}>
-              <p style={{ margin: 0, fontSize: 12, color: theme.red }}>
-                ⚠️ هذا التحليل للأغراض التعليمية فقط. التداول يحمل مخاطر، استشر مستشارك المالي.
-              </p>
-            </div>
+          </div>
+
+          <div style={{ marginTop: 12, padding: 10, borderRadius: 10, background: dark ? "rgba(239,68,68,0.12)" : "#fef2f2", border: `1px solid ${theme.red}`, fontSize: 12, color: theme.red }}>
+            ⚠️ تنبيه: هذا للتحليل التعليمي فقط. التداول مسؤوليتك.
           </div>
         </div>
 
-        {/* History & Statistics */}
-        <div style={{
-          background: theme.card,
-          borderRadius: 16,
-          padding: 20,
-          border: `1px solid ${theme.border}`,
-          boxShadow: dark ? "0 4px 20px rgba(0,0,0,0.2)" : "0 2px 12px rgba(0,0,0,0.05)"
-        }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-            <h2 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>الإحصائيات والسجل</h2>
-            <button
-              onClick={clearHistory}
-              style={{
-                padding: "8px 16px",
-                borderRadius: 10,
-                border: `1px solid ${theme.border}`,
-                background: "transparent",
-                color: theme.fg,
-                cursor: "pointer",
-                fontSize: 14
-              }}
-            >
-              🗑️ مسح السجل
-            </button>
-          </div>
-
-          {/* Statistics Grid */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 16, marginBottom: 24 }}>
-            {[
-              { label: "إجمالي الإشارات", value: stats.total, color: theme.blue },
-              { label: "إشارات شراء", value: stats.buySignals, color: theme.green },
-              { label: "إشارات بيع", value: stats.sellSignals, color: theme.red },
-              { label: "معدل النجاح", value: `${stats.successRate}%`, color: "#8b5cf6" },
-              { label: "متوسط الثقة", value: `${stats.avgConfidence}%`, color: "#f59e0b" },
-              { label: "أفضل أصل", value: stats.bestAsset, color: "#10b981" }
-            ].map((stat, index) => (
-              <div
-                key={index}
-                style={{
-                  padding: 16,
-                  borderRadius: 12,
-                  background: theme.soft,
-                  border: `1px solid ${theme.border}`,
-                  textAlign: "center"
-                }}
-              >
-                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>{stat.label}</div>
-                <div style={{ 
-                  fontSize: 24, 
-                  fontWeight: 700, 
-                  color: typeof stat.color === 'string' ? stat.color : theme.fg 
-                }}>
-                  {stat.value}
+        {/* History */}
+        <div style={{ background: theme.card, borderRadius: 16, padding: 16, border: `1px solid ${theme.border}`, marginTop: 16 }}>
+          <div style={{ fontWeight: 900, fontSize: 18 }}>السجل (آخر 10)</div>
+          <div style={{ marginTop: 10, borderRadius: 10, overflow: "hidden", border: `1px solid ${theme.border}` }}>
+            {history.slice(0, 10).map((h, i) => (
+              <div key={i} style={{ padding: 12, background: i % 2 ? "transparent" : theme.soft, display: "flex", justifyContent: "space-between", gap: 10 }}>
+                <div>
+                  <div style={{ fontWeight: 800 }}>{h.direction} — {h.confidence}%</div>
+                  <div style={{ fontSize: 12, opacity: 0.7 }}>{new Date(h.timestamp).toLocaleString("ar-IQ")} | {h.asset}</div>
+                </div>
+                <div style={{ padding: "4px 10px", borderRadius: 999, background: h.isValid ? theme.green : theme.red, color: "white", fontWeight: 800, fontSize: 12 }}>
+                  {h.isValid ? "صالح" : "ضعيف"}
                 </div>
               </div>
             ))}
-          </div>
-
-          {/* Recent Signals */}
-          <div>
-            <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>آخر الإشارات:</h3>
-            <div style={{
-              maxHeight: 300,
-              overflowY: "auto",
-              borderRadius: 8,
-              border: `1px solid ${theme.border}`
-            }}>
-              {history.slice(0, 10).map((entry, index) => (
-                <div
-                  key={index}
-                  style={{
-                    padding: 16,
-                    borderBottom: `1px solid ${theme.border}`,
-                    background: index % 2 === 0 ? theme.soft : "transparent",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center"
-                  }}
-                >
-                  <div>
-                    <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                      {entry.direction} - {entry.confidence}%
-                    </div>
-                    <div style={{ fontSize: 12, opacity: 0.7 }}>
-                      {new Date(entry.timestamp).toLocaleString('ar-SA')} | {entry.asset}
-                    </div>
-                  </div>
-                  <div style={{
-                    padding: "4px 12px",
-                    borderRadius: 20,
-                    background: entry.isValid ? theme.green : theme.red,
-                    color: "white",
-                    fontSize: 12,
-                    fontWeight: 600
-                  }}>
-                    {entry.isValid ? "✅ صالح" : "❌ غير صالح"}
-                  </div>
-                </div>
-              ))}
-              
-              {history.length === 0 && (
-                <div style={{ padding: 40, textAlign: "center", opacity: 0.5 }}>
-                  لا توجد إشارات مسجلة بعد
-                </div>
-              )}
-            </div>
+            {history.length === 0 && <div style={{ padding: 18, opacity: 0.6 }}>لا يوجد سجل بعد</div>}
           </div>
         </div>
-
-        {/* Footer */}
-        <footer style={{ marginTop: 40, paddingTop: 20, borderTop: `1px solid ${theme.border}` }}>
-          <div style={{ textAlign: "center", fontSize: 12, opacity: 0.7, lineHeight: 1.6 }}>
-            <p>
-              <strong>Deriv Pro Analyzer</strong> - أداة تحليل فني تعليمية
-            </p>
-            <p>
-              ⚠️ هذه الأداة للأغراض التعليمية والتحليلية فقط. جميع قرارات التداول هي مسؤوليتك الخاصة.
-              <br />
-              البيانات مقدمة من Deriv API. الأداء السابق لا يضمن النتائج المستقبلية.
-            </p>
-            <p style={{ marginTop: 8 }}>
-              الإصدار 2.0.0 | آخر تحديث: {new Date().toLocaleDateString('ar-SA')}
-            </p>
-          </div>
-        </footer>
       </div>
-
-      <style jsx>{`
-        @keyframes slideDown {
-          from {
-            transform: translateY(-20px);
-            opacity: 0;
-          }
-          to {
-            transform: translateY(0);
-            opacity: 1;
-          }
-        }
-
-        @media (max-width: 768px) {
-          .container {
-            padding: 12px;
-          }
-          
-          h1 {
-            font-size: 24px;
-          }
-        }
-      `}</style>
     </div>
   );
 }
