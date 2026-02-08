@@ -1,54 +1,66 @@
 import { useEffect, useState } from "react";
 
+const SYMBOLS = {
+  "Volatility 75": "R_75",
+  "Volatility 100": "R_100",
+  "EUR/USD (OTC)": "frxEURUSD",
+  "BTC/USD": "cryBTCUSD"
+};
+
 export default function Home() {
-  const [direction, setDirection] = useState("");
-  const [confidence, setConfidence] = useState(0);
-  const [status, setStatus] = useState("");
-  const [reasons, setReasons] = useState([]);
+  const [symbol, setSymbol] = useState("R_75");
+  const [price, setPrice] = useState("-");
+  const [ws, setWs] = useState(null);
 
   useEffect(() => {
-    const analyze = () => {
-      const up = Math.random() > 0.5;
-      const conf = Math.floor(Math.random() * 20) + 60;
+    const socket = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
 
-      setDirection(up ? "صعود 📈" : "هبوط 📉");
-      setConfidence(conf);
-      setStatus(conf >= 55 ? "مناسب للتداول ✅" : "غير مناسب ❌");
-
-      setReasons([
-        "RSI قريب من التشبع",
-        "تقاطع متوسطات متحركة",
-        "السعر قريب من دعم/مقاومة"
-      ]);
+    socket.onopen = () => {
+      socket.send(
+        JSON.stringify({
+          ticks: symbol,
+          subscribe: 1
+        })
+      );
     };
 
-    analyze();
-    const interval = setInterval(analyze, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    socket.onmessage = (msg) => {
+      const data = JSON.parse(msg.data);
+      if (data.tick) {
+        setPrice(data.tick.quote);
+      }
+    };
+
+    setWs(socket);
+
+    return () => {
+      socket.close();
+    };
+  }, [symbol]);
 
   return (
     <div style={{ direction: "rtl", padding: 20, fontFamily: "Tahoma" }}>
-      <h2>📊 تحليل الخيارات الثنائية – كوتيكس</h2>
+      <h2>📊 تحليل الخيارات الثنائية – Deriv</h2>
 
-      <p><b>العملة:</b> EUR/USD</p>
-      <p><b>المدة:</b> 1 دقيقة</p>
+      <select
+        onChange={(e) => setSymbol(e.target.value)}
+        style={{ marginBottom: 15 }}
+      >
+        {Object.entries(SYMBOLS).map(([name, code]) => (
+          <option key={code} value={code}>
+            {name}
+          </option>
+        ))}
+      </select>
+
+      <p><b>السعر المباشر:</b> {price}</p>
 
       <hr />
 
-      <p><b>الاتجاه المتوقع:</b> {direction}</p>
-      <p><b>نسبة الثقة:</b> {confidence}%</p>
-      <p><b>حالة السوق:</b> {status}</p>
-
-      <p><b>أسباب التحليل:</b></p>
-      <ul>
-        {reasons.map((r, i) => (
-          <li key={i}>{r}</li>
-        ))}
-      </ul>
+      <p>🔍 التحليل راح نضيفه بالخطوة الجاية</p>
 
       <small style={{ color: "gray" }}>
-        ⚠️ التحليل احتمالي وليس توصية مباشرة
+        Demo API من Deriv – بيانات حقيقية
       </small>
     </div>
   );
