@@ -1,6 +1,7 @@
 {
-  "name": "quotex-site",
+  "name": "quotex-site1",
   "version": "1.0.0",
+  "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -10,7 +11,7 @@
     "next": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "lightweight-charts": "^4.2.0"
+    "lightweight-charts": "^4.2.0",
     "technicalindicators": "^3.1.0"
   }
 }
