@@ -1,1095 +1,1640 @@
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+// ===============================
+‏// 1. REQUIREMENTS AND CONFIGURATION
+// ===============================
+const axios = require('axios');
+const WebSocket = require('ws');
+require('dotenv').config();
 
-/**
- * ✅ Quotex Signals Scanner Pro - النسخة المتطورة
- * ------------------------------------------------
- * ✔ قائمة اختيار العملات (يختار المستخدم ما يريد فقط)
- * ✔ تحليل متقدم مع استراتيجيات واضحة
- * ✔ إشارات دخول قبل الدقيقة مع احتمالية التنفيذ
- * ✔ تنبيهات صوتية ومرئية للإشارات
- * ✔ واجهة احترافية وسهلة الاستخدام
- */
-
-// ========= CONFIG =========
-const APP_ID = 1089;
-const WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
-
-const GRANULARITY = 60; // 1m candles
-const HISTORY_COUNT = 200;
-const MIN_CANDLES_FOR_FULL = 35;
-const MIN_CANDLES_MIN = 15;
-
-const MAX_ASSETS = 80;
-const ANALYZE_EVERY_MS = 60_000;
-const TICK_REFRESH_MS = 15_000;
-const SIGNAL_AHEAD_SECONDS = 60; // إشارة قبل 60 ثانية
-
-// ========= العملات الشائعة =========
-const COMMON_PAIRS = [
-  { symbol: "frxEURUSD", name: "EUR/USD", market: "forex" },
-  { symbol: "frxGBPUSD", name: "GBP/USD", market: "forex" },
-  { symbol: "frxUSDJPY", name: "USD/JPY", market: "forex" },
-  { symbol: "frxUSDCHF", name: "USD/CHF", market: "forex" },
-  { symbol: "frxAUDUSD", name: "AUD/USD", market: "forex" },
-  { symbol: "frxUSDCAD", name: "USD/CAD", market: "forex" },
-  { symbol: "frxNZDUSD", name: "NZD/USD", market: "forex" },
-  { symbol: "frxEURGBP", name: "EUR/GBP", market: "forex" },
-  { symbol: "frxEURJPY", name: "EUR/JPY", market: "forex" },
-  { symbol: "frxGBPJPY", name: "GBP/JPY", market: "forex" },
-  { symbol: "CRYPTOC_BTCUSD", name: "Bitcoin/USD", market: "cryptocurrency" },
-  { symbol: "CRYPTOC_ETHUSD", name: "Ethereum/USD", market: "cryptocurrency" },
-  { symbol: "CRYPTOC_XRPUSD", name: "Ripple/USD", market: "cryptocurrency" },
-  { symbol: "CRYPTOC_ADAUSD", name: "Cardano/USD", market: "cryptocurrency" },
-  { symbol: "CRYPTOC_SOLUSD", name: "Solana/USD", market: "cryptocurrency" },
-  { symbol: "OTC_XAUUSD", name: "الذهب", market: "commodities" },
-  { symbol: "OTC_XAGUSD", name: "الفضة", market: "commodities" },
-  { symbol: "OTC_WTI_OIL", name: "النفط الخام", market: "commodities" },
-  { symbol: "R_50", name: "S&P 500", market: "indices" },
-  { symbol: "R_100", name: "Nasdaq 100", market: "indices" },
-  { symbol: "frxXAUUSD", name: "الذهب فوركس", market: "commodities" },
-  { symbol: "frxXAGUSD", name: "الفضة فوركس", market: "commodities" },
-];
-
-// ========= UTILS =========
-const bucketStart = (epoch, durationSec) => epoch - (epoch % durationSec);
-const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
-const avg = (arr) => (arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : 0);
-const stdDev = (arr) => {
-  if (!arr.length) return 0;
-  const m = avg(arr);
-  const v = arr.reduce((s, x) => s + (x - m) * (x - m), 0) / arr.length;
-  return Math.sqrt(v);
-};
-
-// ========= INDICATORS =========
-function ema(values, period) {
-  if (!values || values.length < period) return null;
-  const k = 2 / (period + 1);
-  let e = avg(values.slice(0, period));
-  for (let i = period; i < values.length; i++) e = values[i] * k + e * (1 - k);
-  return e;
-}
-
-function rsi(values, period = 14) {
-  if (!values || values.length < period + 1) return null;
-  let gains = 0;
-  let losses = 0;
-  for (let i = values.length - period; i < values.length; i++) {
-    const diff = values[i] - values[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses += Math.abs(diff);
-  }
-  if (losses === 0) return 100;
-  const rs = gains / losses;
-  return 100 - 100 / (1 + rs);
-}
-
-function macd(values, fast = 12, slow = 26, signal = 9) {
-  if (!values || values.length < slow + signal + 5) return null;
-  const macdLine = [];
-  for (let i = 0; i < values.length; i++) {
-    const slice = values.slice(0, i + 1);
-    const ef = ema(slice, fast);
-    const es = ema(slice, slow);
-    if (ef != null && es != null) macdLine.push(ef - es);
-  }
-  if (macdLine.length < signal + 3) return null;
-  const signalLine = ema(macdLine, signal);
-  const lastMacd = macdLine[macdLine.length - 1];
-  return {
-    macd: lastMacd,
-    signal: signalLine,
-    hist: signalLine != null ? lastMacd - signalLine : null
-  };
-}
-
-// ========= AUDIO ALERT =========
-const playAlert = (type = "signal") => {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-
-    if (type === "buy") {
-      osc.frequency.setValueAtTime(800, ctx.currentTime);
-      osc.frequency.setValueAtTime(1200, ctx.currentTime + 0.1);
-    } else if (type === "sell") {
-      osc.frequency.setValueAtTime(420, ctx.currentTime);
-      osc.frequency.setValueAtTime(320, ctx.currentTime + 0.1);
-    } else {
-      osc.frequency.setValueAtTime(660, ctx.currentTime);
+// ===============================
+// 2. TELEGRAM SENDER
+// ===============================
+class TelegramSender {
+    constructor() {
+        this.sentHashes = new Map();
+        this.cooldown = new Map();
+        this.token = process.env.TELEGRAM_BOT_TOKEN;
+        this.chatId = process.env.TELEGRAM_CHAT_ID;
     }
-    
-    gain.gain.setValueAtTime(0.1, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
 
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.3);
-    setTimeout(() => ctx.close(), 500);
-  } catch {}
-};
-
-// ========= WS MANAGER =========
-class WSManager {
-  constructor() {
-    this.ws = null;
-    this.isConnected = false;
-    this.reconnectAttempts = 0;
-    this.maxReconnect = 8;
-    this.baseDelay = 900;
-
-    this.onMessage = null;
-    this.onOpen = null;
-    this.onClose = null;
-    this.onError = null;
-
-    this.subscribed = new Set();
-    this.historyQueue = [];
-    this.historyTimer = null;
-  }
-
-  connect({ onMessage, onOpen, onClose, onError }) {
-    this.onMessage = onMessage;
-    this.onOpen = onOpen;
-    this.onClose = onClose;
-    this.onError = onError;
-
-    try {
-      this.ws = new WebSocket(WS_URL);
-
-      this.ws.onopen = () => {
-        this.isConnected = true;
-        this.reconnectAttempts = 0;
-        this.onOpen?.();
-        [...this.subscribed].forEach((s) => this.send({ ticks: s, subscribe: 1 }));
-      };
-
-      this.ws.onmessage = (ev) => this.onMessage?.(ev);
-
-      this.ws.onclose = () => {
-        this.isConnected = false;
-        this.stopHistoryPump();
-        this.onClose?.();
-        this.reconnect();
-      };
-
-      this.ws.onerror = (e) => this.onError?.(e);
-    } catch (e) {
-      this.onError?.(e);
-      this.reconnect();
-    }
-  }
-
-  reconnect() {
-    if (this.reconnectAttempts >= this.maxReconnect) return;
-    this.reconnectAttempts++;
-    const delay = this.baseDelay * this.reconnectAttempts;
-    setTimeout(() => {
-      this.connect({
-        onMessage: this.onMessage,
-        onOpen: this.onOpen,
-        onClose: this.onClose,
-        onError: this.onError
-      });
-    }, delay);
-  }
-
-  send(payload) {
-    if (!this.ws || !this.isConnected) return false;
-    try {
-      this.ws.send(JSON.stringify(payload));
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  disconnect() {
-    this.stopHistoryPump();
-    this.subscribed.clear();
-    this.isConnected = false;
-    try {
-      this.ws?.close();
-    } catch {}
-    this.ws = null;
-  }
-
-  subscribe(symbol) {
-    this.subscribed.add(symbol);
-    return this.send({ ticks: symbol, subscribe: 1 });
-  }
-
-  unsubscribe(symbol) {
-    this.subscribed.delete(symbol);
-    return this.send({ ticks: symbol, subscribe: 0 });
-  }
-
-  requestActiveSymbols() {
-    return this.send({ active_symbols: "brief", product_type: "basic" });
-  }
-
-  queueHistory(symbol) {
-    this.historyQueue.push(symbol);
-    this.startHistoryPump();
-  }
-
-  startHistoryPump() {
-    if (this.historyTimer) return;
-    this.historyTimer = setInterval(() => {
-      if (!this.isConnected) return;
-      const sym = this.historyQueue.shift();
-      if (!sym) {
-        this.stopHistoryPump();
-        return;
-      }
-      this.send({
-        ticks_history: sym,
-        adjust_start_time: 1,
-        count: HISTORY_COUNT,
-        end: "latest",
-        start: 1,
-        style: "candles",
-        granularity: GRANULARITY
-      });
-    }, 140);
-  }
-
-  stopHistoryPump() {
-    if (this.historyTimer) clearInterval(this.historyTimer);
-    this.historyTimer = null;
-    this.historyQueue = [];
-  }
-}
-
-// ========= STRATEGIES =========
-const STRATEGIES = [
-  {
-    id: "trend_follow",
-    name: "تابع الترند",
-    description: "تداول في اتجاه الترند الرئيسي مع تأكيد من المتوسطات المتحركة",
-    conditions: {
-      emaCross: true,
-      rsiConfirmation: true,
-      volume: false
-    }
-  },
-  {
-    id: "rsi_reversal",
-    name: "انعكاس RSI",
-    description: "تداول عند التشبع الشرائي أو البيعي في RSI",
-    conditions: {
-      rsiExtreme: true,
-      candlestickPattern: true,
-      macdDivergence: true
-    }
-  },
-  {
-    id: "breakout",
-    name: "اختراق",
-    description: "تداول عند اختراق مستويات المقاومة أو الدعم",
-    conditions: {
-      supportResistance: true,
-      highVolume: true,
-      volatility: true
-    }
-  }
-];
-
-// ========= MAIN COMPONENT =========
-export default function Home() {
-  const wsRef = useRef(new WSManager());
-  const storeRef = useRef({});
-  const signalsRef = useRef([]);
-
-  const [status, setStatus] = useState("connecting");
-  const [cards, setCards] = useState([]);
-  const [signals, setSignals] = useState([]);
-  const [note, setNote] = useState(null);
-  const [dark, setDark] = useState(true);
-  const [sound, setSound] = useState(true);
-  const [selectedPairs, setSelectedPairs] = useState(COMMON_PAIRS.slice(0, 10).map(p => p.symbol));
-  const [showAllAssets, setShowAllAssets] = useState(false);
-  const [strategy, setStrategy] = useState(STRATEGIES[0].id);
-  const [strengthFilter, setStrengthFilter] = useState(70);
-
-  const lastAlertRef = useRef({ t: 0, key: "" });
-
-  const theme = useMemo(() => {
-    const bg = dark ? "#0b1220" : "#ffffff";
-    const fg = dark ? "#e5e7eb" : "#0b1220";
-    const card = dark ? "rgba(17,24,39,0.85)" : "#ffffff";
-    const border = dark ? "rgba(148,163,184,0.25)" : "#e5e7eb";
-    const soft = dark ? "rgba(17,24,39,0.45)" : "#f8fafc";
-    const blue = dark ? "#60a5fa" : "#2563eb";
-    const green = dark ? "#34d399" : "#16a34a";
-    const red = dark ? "#f87171" : "#dc2626";
-    const amber = dark ? "#fbbf24" : "#f59e0b";
-    const purple = dark ? "#c084fc" : "#9333ea";
-    return { bg, fg, card, border, soft, blue, green, red, amber, purple };
-  }, [dark]);
-
-  // ======== تحليل متقدم مع استراتيجية ========
-  const analyzeSymbol = useCallback(
-    (sym) => {
-      const item = storeRef.current[sym];
-      if (!item) return;
-
-      const candles = item.candles || [];
-      const lastCandle = item.lastCandle;
-      const merged = lastCandle ? [...candles, lastCandle] : [...candles];
-      const closes = merged.map((c) => c.close).filter((x) => Number.isFinite(x));
-      const volumes = merged.map((c) => c.volume).filter((x) => Number.isFinite(x));
-
-      if (closes.length < MIN_CANDLES_MIN) {
-        item.analysis = {
-          dir: "WAIT",
-          conf: 0,
-          tag: "انتظر",
-          color: "muted",
-          market: "جمع بيانات",
-          reasons: [`عدد الشموع: ${closes.length} (نحتاج ${MIN_CANDLES_MIN}+ )`],
-          signals: [],
-          updatedAt: Date.now()
-        };
-        return;
-      }
-
-      const last = closes[closes.length - 1];
-      const prev = closes[closes.length - 2];
-      const delta = last - prev;
-
-      // تحليل السوق
-      const recent = closes.slice(-20);
-      const v = avg(recent) ? stdDev(recent) / avg(recent) : 0;
-      const market = v > 0.02 ? "تذبذب عالي" : v < 0.005 ? "هادئ" : "طبيعي";
-
-      // مؤشرات
-      const r = rsi(closes, 14);
-      const e9 = ema(closes, 9);
-      const e21 = ema(closes, 21);
-      const e50 = ema(closes, 50);
-      const m = macd(closes, 12, 26, 9);
-      
-      // حجم التداول
-      const avgVolume = avg(volumes.slice(-10)) || 1;
-      const lastVolume = volumes[volumes.length - 1] || 0;
-      const volumeRatio = lastVolume / avgVolume;
-
-      let buyScore = 0;
-      let sellScore = 0;
-      const reasons = [];
-      const signals = [];
-
-      // استراتيجية: تابع الترند
-      if (strategy === "trend_follow") {
-        if (e9 && e21) {
-          if (e9 > e21) {
-            buyScore += 3;
-            reasons.push("📈 EMA9 فوق EMA21 - ترند صاعد");
-          } else {
-            sellScore += 3;
-            reasons.push("📉 EMA9 تحت EMA21 - ترند هابط");
-          }
-        }
-
-        if (e50 && last > e50) {
-          buyScore += 2;
-          reasons.push("🚀 السعر فوق EMA50 - دعم قوي");
-        } else if (e50 && last < e50) {
-          sellScore += 2;
-          reasons.push("⚠️ السعر تحت EMA50 - مقاومة قوية");
-        }
-
-        if (r != null && r > 40 && r < 60) {
-          if (e9 && e21 && e9 > e21) {
-            buyScore += 1;
-            reasons.push("✅ RSI في المدى المتوسط مع ترند صاعد");
-          } else if (e9 && e21 && e9 < e21) {
-            sellScore += 1;
-            reasons.push("✅ RSI في المدى المتوسط مع ترند هابط");
-          }
-        }
-      }
-
-      // استراتيجية: انعكاس RSI
-      else if (strategy === "rsi_reversal") {
-        if (r != null) {
-          if (r < 30) {
-            buyScore += 4;
-            reasons.push("🔄 RSI تشبع بيع (${r.toFixed(1)}) - انعكاس متوقع");
-            
-            // إشارة دخول قبلية
-            if (r < 25 && volumeRatio > 1.5) {
-              signals.push({
-                type: "BUY",
-                reason: "تشبع بيع قوي مع حجم مرتفع",
-                probability: 85,
-                timeAhead: SIGNAL_AHEAD_SECONDS
-              });
+    async sendTelegram(text, symbol, signalHash) {
+        // التحقق من التبريد
+        if (this.cooldown.has(symbol)) {
+            const cooldownUntil = this.cooldown.get(symbol);
+            if (Date.now() < cooldownUntil) {
+                console.log(`⏳ Cooldown for ${symbol}, skipping...`);
+                return false;
             }
-          } else if (r > 70) {
-            sellScore += 4;
-            reasons.push("🔄 RSI تشبع شراء (${r.toFixed(1)}) - انعكاس متوقع");
-            
-            if (r > 75 && volumeRatio > 1.5) {
-              signals.push({
-                type: "SELL",
-                reason: "تشبع شراء قوي مع حجم مرتفع",
-                probability: 85,
-                timeAhead: SIGNAL_AHEAD_SECONDS
-              });
+        }
+
+        // التحقق من التكرار
+        if (this.sentHashes.has(signalHash)) {
+            console.log(`♻️ Duplicate signal for ${symbol}, skipping...`);
+            return false;
+        }
+
+        // Retry logic
+        let retries = 3;
+        while (retries > 0) {
+            try {
+                const response = await axios.post(
+                    `https://api.telegram.org/bot${this.token}/sendMessage`,
+                    {
+                        chat_id: this.chatId,
+                        text: text,
+                        parse_mode: 'HTML',
+                        disable_web_page_preview: true
+                    },
+                    { timeout: 5000 }
+                );
+
+                if (response.data.ok) {
+                    this.sentHashes.set(signalHash, Date.now());
+                    this.cooldown.set(symbol, Date.now() + 30 * 60 * 1000);
+                    
+                    this.cleanOldHashes();
+                    
+                    console.log(`✅ Telegram sent for ${symbol}`);
+                    return true;
+                }
+            } catch (error) {
+                console.error(`❌ Telegram error (${retries} retries left):`, error.message);
+                retries--;
+                await new Promise(resolve => setTimeout(resolve, 1000));
             }
-          }
         }
+        return false;
+    }
 
-        // تحليل شموع الانعكاس
-        if (candles.length >= 3) {
-          const current = candles[candles.length - 1];
-          const previous = candles[candles.length - 2];
-          const before = candles[candles.length - 3];
-          
-          if (current.close > current.open && previous.close < previous.open && before.close < before.open) {
-            buyScore += 2;
-            reasons.push("🕯️ نمط شموع انعكاسي صاعد");
-          } else if (current.close < current.open && previous.close > previous.open && before.close > before.open) {
-            sellScore += 2;
-            reasons.push("🕯️ نمط شموع انعكاسي هابط");
-          }
+    cleanOldHashes() {
+        const fourHoursAgo = Date.now() - 4 * 60 * 60 * 1000;
+        for (const [hash, timestamp] of this.sentHashes.entries()) {
+            if (timestamp < fourHoursAgo) {
+                this.sentHashes.delete(hash);
+            }
         }
-      }
+    }
+}
 
-      // استراتيجية: اختراق
-      else if (strategy === "breakout") {
-        // حساب مستويات الدعم والمقاومة
-        const recentHigh = Math.max(...closes.slice(-20));
-        const recentLow = Math.min(...closes.slice(-20));
-        const range = recentHigh - recentLow;
-        const resistance = recentHigh - range * 0.1;
-        const support = recentLow + range * 0.1;
+// ===============================
+// 3. SYMBOL STORE
+// ===============================
+class SymbolStore {
+    constructor(symbolInfo) {
+        this.symbol = symbolInfo.symbol;
+        this.name = symbolInfo.display_name;
+        this.market = symbolInfo.market;
+        this.pip = symbolInfo.pip;
+        
+        this.candles = [];
+        this.lastCandle = null;
+        this.currentCandle = null;
+        
+        this.state = 'WAIT';
+        this.analysis = null;
+        
+        this.cooldownUntil = 0;
+        this.lastSignalHash = '';
+        this.lastSignalTime = 0;
+        
+        this.lastAnalysisTime = 0;
+        this.ticksCount = 0;
+        
+        // سيتم تحديثها باستمرار
+        this.isActiveSessionTime = false;
+        this.hasHighImpactNews = false;
+    }
 
-        if (last > resistance && volumeRatio > 1.2) {
-          buyScore += 4;
-          reasons.push("🚀 اختراق مقاومة مع حجم قوي");
-          
-          signals.push({
-            type: "BUY",
-            reason: "اختراق مقاومة مؤكد",
-            probability: 80,
-            timeAhead: SIGNAL_AHEAD_SECONDS
-          });
-        } else if (last < support && volumeRatio > 1.2) {
-          sellScore += 4;
-          reasons.push("📉 اختراق دعم مع حجم قوي");
-          
-          signals.push({
-            type: "SELL",
-            reason: "اختراق دعم مؤكد",
-            probability: 80,
-            timeAhead: SIGNAL_AHEAD_SECONDS
-          });
-        }
-
-        // التذبذب
-        if (v > 0.015) {
-          if (last > e9 && e9 > e21) {
-            buyScore += 2;
-            reasons.push("⚡ سوق متذبذب مع ترند صاعد");
-          } else if (last < e9 && e9 < e21) {
-            sellScore += 2;
-            reasons.push("⚡ سوق متذبذب مع ترند هابط");
-          }
-        }
-      }
-
-      // مؤشرات عامة
-      if (m && m.macd != null && m.signal != null) {
-        if (m.macd > m.signal && m.hist > 0) {
-          buyScore += 2;
-          reasons.push("📊 MACD إيجابي ومتزايد");
-        } else if (m.macd < m.signal && m.hist < 0) {
-          sellScore += 2;
-          reasons.push("📊 MACD سلبي ومتزايد");
-        }
-      }
-
-      if (delta > 0) {
-        buyScore += 1;
-        if (volumeRatio > 1.3) reasons.push("⚡ زخم صاعد مع حجم عالي");
-        else reasons.push("↗️ إغلاق أعلى من السابق");
-      } else if (delta < 0) {
-        sellScore += 1;
-        if (volumeRatio > 1.3) reasons.push("⚡ زخم هابط مع حجم عالي");
-        else reasons.push("↘️ إغلاق أقل من السابق");
-      }
-
-      // حساب النتيجة النهائية
-      const total = buyScore + sellScore;
-      const conf = total ? Math.round((Math.max(buyScore, sellScore) / total) * 100) : 0;
-
-      let dir = "WAIT";
-      if (buyScore > sellScore && conf >= 60) dir = "CALL";
-      else if (sellScore > buyScore && conf >= 60) dir = "PUT";
-
-      const ok = conf >= strengthFilter && Math.abs(buyScore - sellScore) >= 2;
-
-      const tag = !ok ? "انتظر" : dir === "CALL" ? "CALL ⬆️" : dir === "PUT" ? "PUT ⬇️" : "انتظر";
-      const color = !ok ? "muted" : dir === "CALL" ? "green" : "red";
-
-      item.analysis = {
-        dir,
-        conf: ok ? conf : Math.max(0, conf - 10),
-        tag,
-        color,
-        market,
-        reasons: reasons.slice(0, 4),
-        signals: signals.slice(0, 2),
-        updatedAt: Date.now()
-      };
-
-      // إضافة إشارة جديدة إذا كانت قوية
-      if (signals.length > 0 && ok && conf >= strengthFilter) {
-        const newSignal = {
-          id: `${sym}_${Date.now()}`,
-          symbol: sym,
-          name: item.name,
-          type: dir === "CALL" ? "BUY" : "SELL",
-          reason: signals[0].reason,
-          probability: signals[0].probability,
-          confidence: conf,
-          price: item.price,
-          timestamp: Date.now(),
-          timeAhead: signals[0].timeAhead
-        };
-
-        signalsRef.current = [newSignal, ...signalsRef.current].slice(0, 20);
-        setSignals(signalsRef.current);
-
-        if (sound && conf >= 75) {
-          const key = `${sym}:${dir}`;
-          const now = Date.now();
-          if (now - lastAlertRef.current.t > 30_000 || lastAlertRef.current.key !== key) {
-            playAlert(dir === "CALL" ? "buy" : "sell");
-            lastAlertRef.current = { t: now, key };
-          }
-        }
-      }
-    },
-    [sound, strategy, strengthFilter]
-  );
-
-  // ======== تحديث البطاقات ========
-  const rebuildCards = useCallback(() => {
-    const map = storeRef.current;
-    const list = Object.values(map)
-      .filter(item => selectedPairs.includes(item.symbol))
-      .map((x) => ({
-        symbol: x.symbol,
-        name: x.name || x.symbol,
-        market: x.market || "",
-        price: x.price,
-        analysis: x.analysis,
-        lastUpdate: x.lastUpdate
-      }))
-      .sort((a, b) => (b.analysis?.conf ?? 0) - (a.analysis?.conf ?? 0));
-
-    setCards(list);
-  }, [selectedPairs]);
-
-  // ======== اتصال WebSocket ========
-  useEffect(() => {
-    const ws = wsRef.current;
-    let mounted = true;
-
-    const onOpen = () => {
-      if (!mounted) return;
-      setStatus("connected");
-      setNote({ type: "ok", msg: "✅ تم الاتصال — جاري تحميل البيانات..." });
-      
-      // الاشتراك في العملات المحددة فقط
-      selectedPairs.forEach(symbol => {
-        ws.subscribe(symbol);
-        ws.queueHistory(symbol);
-      });
-    };
-
-    const onClose = () => mounted && setStatus("disconnected");
-    const onError = () => mounted && setStatus("error");
-
-    const onMessage = (event) => {
-      if (!mounted) return;
-
-      let data;
-      try {
-        data = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-
-      // بيانات الشموع
-      if (data.candles && Array.isArray(data.candles) && data.echo_req?.ticks_history) {
-        const sym = data.echo_req.ticks_history;
-        const item = storeRef.current[sym];
-        if (!item) return;
-
-        const candles = data.candles
-          .map((c) => ({
-            time: Number(c.epoch),
-            open: Number(c.open),
-            high: Number(c.high),
-            low: Number(c.low),
-            close: Number(c.close),
-            volume: Number(c.volume) || 0
-          }))
-          .filter(
-            (c) =>
-              Number.isFinite(c.time) &&
-              Number.isFinite(c.open) &&
-              Number.isFinite(c.high) &&
-              Number.isFinite(c.low) &&
-              Number.isFinite(c.close)
-          )
-          .slice(-HISTORY_COUNT);
-
-        item.candles = candles;
-        item.lastCandle = candles[candles.length - 1] || null;
-        item.lastUpdate = Date.now();
-
-        analyzeSymbol(sym);
-        rebuildCards();
-        return;
-      }
-
-      // التحديثات اللحظية
-      if (data.tick && data.tick.symbol) {
-        const sym = data.tick.symbol;
-        const item = storeRef.current[sym];
-        if (!item) return;
-
-        const epoch = Math.floor(data.tick.epoch);
-        const px = Number(data.tick.quote);
-        if (!Number.isFinite(px)) return;
-
-        item.price = px;
-        item.lastUpdate = Date.now();
-
-        const candleStart = bucketStart(epoch, GRANULARITY);
-        const cur = item.lastCandle;
-
-        if (!cur || cur.time !== candleStart) {
-          if (cur) item.candles = [...item.candles, cur].slice(-HISTORY_COUNT);
-
-          item.lastCandle = {
-            time: candleStart,
-            open: px,
-            high: px,
-            low: px,
-            close: px,
-            volume: 1
-          };
-
-          analyzeSymbol(sym);
-          rebuildCards();
+    updateCandle(tick) {
+        const tickTime = tick.epoch * 1000;
+        const candleStart = Math.floor(tickTime / 60000) * 60000;
+        
+        if (!this.currentCandle || this.currentCandle.start !== candleStart) {
+            if (this.currentCandle) {
+                this.candles.push({ ...this.currentCandle });
+                
+                if (this.candles.length > 200) {
+                    this.candles.shift();
+                }
+                
+                this.lastCandle = { ...this.currentCandle };
+            }
+            
+            this.currentCandle = {
+                start: candleStart,
+                open: tick.quote,
+                high: tick.quote,
+                low: tick.quote,
+                close: tick.quote,
+                volume: 1
+            };
+            
+            return true;
         } else {
-          item.lastCandle = {
-            ...cur,
-            high: Math.max(cur.high, px),
-            low: Math.min(cur.low, px),
-            close: px,
-            volume: (cur.volume || 0) + 1
-          };
+            this.currentCandle.high = Math.max(this.currentCandle.high, tick.quote);
+            this.currentCandle.low = Math.min(this.currentCandle.low, tick.quote);
+            this.currentCandle.close = tick.quote;
+            this.currentCandle.volume++;
+            
+            return false;
         }
-      }
-
-      if (data.error) {
-        setNote({ type: "err", msg: `❌ خطأ: ${data.error.message || "غير معروف"}` });
-      }
-    };
-
-    setStatus("connecting");
-    
-    // تهيئة المتجر بالعملات المختارة
-    selectedPairs.forEach(symbol => {
-      const pairInfo = COMMON_PAIRS.find(p => p.symbol === symbol) || { symbol, name: symbol, market: "unknown" };
-      storeRef.current[symbol] = {
-        symbol,
-        name: pairInfo.name,
-        market: pairInfo.market,
-        price: undefined,
-        candles: [],
-        lastCandle: null,
-        analysis: {
-          dir: "WAIT",
-          conf: 0,
-          tag: "انتظر",
-          color: "muted",
-          market: "—",
-          reasons: ["جاري تحميل البيانات..."],
-          signals: [],
-          updatedAt: Date.now()
-        },
-        lastUpdate: undefined
-      };
-    });
-
-    ws.connect({ onMessage, onOpen, onClose, onError });
-
-    return () => {
-      mounted = false;
-      ws.disconnect();
-    };
-  }, [analyzeSymbol, rebuildCards, selectedPairs]);
-
-  // ======== التحليل الدوري ========
-  useEffect(() => {
-    const t1 = setInterval(() => {
-      Object.keys(storeRef.current).forEach((sym) => analyzeSymbol(sym));
-      rebuildCards();
-    }, ANALYZE_EVERY_MS);
-
-    const t2 = setInterval(() => {
-      Object.keys(storeRef.current).forEach((sym) => {
-        const it = storeRef.current[sym];
-        if (!it) return;
-        if ((it.candles?.length || 0) >= MIN_CANDLES_MIN) analyzeSymbol(sym);
-      });
-      rebuildCards();
-    }, TICK_REFRESH_MS);
-
-    return () => {
-      clearInterval(t1);
-      clearInterval(t2);
-    };
-  }, [analyzeSymbol, rebuildCards]);
-
-  // ======== إدارة العملات المختارة ========
-  const handlePairToggle = (symbol) => {
-    const newSelected = selectedPairs.includes(symbol)
-      ? selectedPairs.filter(s => s !== symbol)
-      : [...selectedPairs, symbol];
-    
-    setSelectedPairs(newSelected);
-    
-    const ws = wsRef.current;
-    if (ws.isConnected) {
-      if (newSelected.includes(symbol)) {
-        ws.subscribe(symbol);
-        ws.queueHistory(symbol);
-      } else {
-        ws.unsubscribe(symbol);
-        delete storeRef.current[symbol];
-      }
     }
-  };
+}
 
-  const handleSelectAll = () => {
-    const allSymbols = COMMON_PAIRS.map(p => p.symbol);
-    setSelectedPairs(allSymbols);
-  };
+// ===============================
+// 4. TECHNICAL ANALYSIS UTILS (مع تصحيح RSI)
+// ===============================
+class TechnicalAnalysis {
+    static calculateRSI(candles, period = 14) {
+        if (candles.length < period + 1) return 50;
+        
+        let gains = 0;
+        let losses = 0;
+        
+        // استخدام period + 1 شمعة للتحقق من التغيرات
+        const startIndex = Math.max(0, candles.length - (period + 1));
+        const relevantCandles = candles.slice(startIndex);
+        
+        for (let i = 1; i < relevantCandles.length; i++) {
+            const change = relevantCandles[i].close - relevantCandles[i-1].close;
+            if (change > 0) {
+                gains += change;
+            } else {
+                losses -= change;
+            }
+        }
+        
+        const avgGain = gains / period;
+        const avgLoss = losses / period;
+        
+        if (avgLoss === 0) return 100;
+        if (avgGain === 0) return 0;
+        
+        const rs = avgGain / avgLoss;
+        return 100 - (100 / (1 + rs));
+    }
 
-  const handleDeselectAll = () => {
-    setSelectedPairs([]);
-  };
+    static calculateSMA(candles) {
+        if (candles.length === 0) return 0;
+        const sum = candles.reduce((acc, c) => acc + c.close, 0);
+        return sum / candles.length;
+    }
 
-  // ======== إحصائيات ========
-  const stats = useMemo(() => {
-    const total = cards.length;
-    const calls = cards.filter((c) => c.analysis?.dir === "CALL" && c.analysis?.color !== "muted").length;
-    const puts = cards.filter((c) => c.analysis?.dir === "PUT" && c.analysis?.color !== "muted").length;
-    const wait = total - calls - puts;
-    const strongSignals = signals.filter(s => s.confidence >= 80).length;
-    return { total, calls, puts, wait, strongSignals };
-  }, [cards, signals]);
+    static calculateEMA(candles, period) {
+        if (candles.length < period) return this.calculateSMA(candles);
+        
+        let ema = this.calculateSMA(candles.slice(0, period));
+        const multiplier = 2 / (period + 1);
+        
+        for (let i = period; i < candles.length; i++) {
+            ema = (candles[i].close - ema) * multiplier + ema;
+        }
+        
+        return ema;
+    }
 
-  // ======== مساعدات العرض ========
-  const badge = (color) => {
-    if (color === "green") return { bg: theme.green, fg: "#fff" };
-    if (color === "red") return { bg: theme.red, fg: "#fff" };
-    return { bg: theme.soft, fg: theme.fg };
-  };
-
-  const timeAgo = (ts) => {
-    if (!ts) return "—";
-    const s = Math.floor((Date.now() - ts) / 1000);
-    if (s < 5) return "الآن";
-    if (s < 60) return `${s} ثانية`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m} دقيقة`;
-    const h = Math.floor(m / 60);
-    return `${h} ساعة`;
-  };
-
-  return (
-    <div
-      style={{
-        background: theme.bg,
-        color: theme.fg,
-        minHeight: "100vh",
-        direction: "rtl",
-        fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif"
-      }}
-    >
-      {note && (
-        <div style={{ position: "fixed", top: 16, left: 16, right: 16, maxWidth: 900, margin: "0 auto", zIndex: 9999 }}>
-          <div
-            style={{
-              padding: "12px 14px",
-              borderRadius: 14,
-              border: `1px solid ${theme.border}`,
-              background: note.type === "err" ? "rgba(239,68,68,0.22)" : "rgba(59,130,246,0.18)",
-              backdropFilter: "blur(10px)",
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 10,
-              alignItems: "center"
-            }}
-          >
-            <div style={{ fontWeight: 700 }}>{note.msg}</div>
-            <button onClick={() => setNote(null)} style={{ border: "none", background: "transparent", color: theme.fg, cursor: "pointer", fontSize: 18, lineHeight: 1 }}>
-              ✕
-            </button>
-          </div>
-        </div>
-      )}
-
-      <div style={{ maxWidth: 1480, margin: "0 auto", padding: "26px 18px" }}>
-        {/* الهيدر */}
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <div>
-            <div style={{ fontSize: 28, fontWeight: 900, color: theme.blue }}>⚡ Quotex Signals Scanner Pro</div>
-            <div style={{ opacity: 0.8, fontSize: 13, marginTop: 2 }}>إشارات ذكية مع تحليل متقدم واستراتيجيات محددة</div>
-          </div>
-
-          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <span style={{ padding: "7px 12px", borderRadius: 999, border: `1px solid ${theme.border}`, background: theme.card, fontWeight: 800, fontSize: 12 }}>
-              الحالة:{" "}
-              <span style={{ color: status === "connected" ? theme.green : status === "connecting" ? theme.amber : theme.red }}>
-                {status === "connected" ? "متصل ✓" : status === "connecting" ? "جاري الاتصال..." : status === "error" ? "خطأ" : "غير متصل"}
-              </span>
-            </span>
-
-            <button onClick={() => setDark((v) => !v)} style={{ padding: "9px 12px", borderRadius: 12, border: `1px solid ${theme.border}`, background: theme.card, color: theme.fg, cursor: "pointer", fontWeight: 700 }}>
-              {dark ? "☀️ نهاري" : "🌙 ليلي"}
-            </button>
-
-            <button onClick={() => setSound((v) => !v)} style={{ padding: "9px 12px", borderRadius: 12, border: `1px solid ${theme.border}`, background: theme.card, color: theme.fg, cursor: "pointer", fontWeight: 700 }}>
-              {sound ? "🔊 صوت: ON" : "🔇 صوت: OFF"}
-            </button>
-          </div>
-        </div>
-
-        {/* الإحصائيات */}
-        <div style={{ marginTop: 14, background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 14, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-          {[
-            { label: "العملات المختارة", value: selectedPairs.length, c: theme.blue },
-            { label: "إشارات CALL", value: stats.calls, c: theme.green },
-            { label: "إشارات PUT", value: stats.puts, c: theme.red },
-            { label: "إشارات قوية", value: stats.strongSignals, c: theme.purple },
-            { label: "في الانتظار", value: stats.wait, c: theme.fg }
-          ].map((x, i) => (
-            <div key={i} style={{ flex: "1 1 140px", minWidth: 140, borderRadius: 14, border: `1px solid ${theme.border}`, background: theme.soft, padding: "10px 12px" }}>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>{x.label}</div>
-              <div style={{ fontSize: 22, fontWeight: 900, color: x.c }}>{x.value}</div>
-            </div>
-          ))}
-        </div>
-
-        {/* لوحة التحكم */}
-        <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 12 }}>
-          {/* اختيار العملات */}
-          <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 14 }}>
-            <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 12 }}>🏷️ اختر العملات</div>
-            <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-              <button onClick={handleSelectAll} style={{ padding: "6px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.soft, color: theme.fg, cursor: "pointer", fontSize: 12 }}>
-                اختيار الكل
-              </button>
-              <button onClick={handleDeselectAll} style={{ padding: "6px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.soft, color: theme.fg, cursor: "pointer", fontSize: 12 }}>
-                إلغاء الكل
-              </button>
-            </div>
-            <div style={{ maxHeight: 200, overflowY: "auto", background: theme.soft, borderRadius: 10, padding: 10 }}>
-              {COMMON_PAIRS.map((pair) => (
-                <div key={pair.symbol} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                  <input
-                    type="checkbox"
-                    id={pair.symbol}
-                    checked={selectedPairs.includes(pair.symbol)}
-                    onChange={() => handlePairToggle(pair.symbol)}
-                    style={{ cursor: "pointer" }}
-                  />
-                  <label htmlFor={pair.symbol} style={{ fontSize: 13, cursor: "pointer", flex: 1 }}>
-                    {pair.name} <span style={{ opacity: 0.6 }}>({pair.symbol})</span>
-                  </label>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* الاستراتيجية */}
-          <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 14 }}>
-            <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 12 }}>🎯 الاستراتيجية</div>
-            <select 
-              value={strategy} 
-              onChange={(e) => setStrategy(e.target.value)}
-              style={{ width: "100%", padding: "8px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.soft, color: theme.fg, marginBottom: 12 }}
-            >
-              {STRATEGIES.map(s => (
-                <option key={s.id} value={s.id}>{s.name}</option>
-              ))}
-            </select>
-            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
-              {STRATEGIES.find(s => s.id === strategy)?.description}
-            </div>
+    static calculateATR(candles, period = 14) {
+        if (candles.length < period + 1) return 0;
+        
+        let trueRanges = [];
+        const startIdx = Math.max(1, candles.length - period - 1);
+        
+        for (let i = startIdx; i < candles.length; i++) {
+            const high = candles[i].high;
+            const low = candles[i].low;
+            const prevClose = candles[i-1].close;
             
-            <div style={{ marginTop: 12 }}>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>قوة الإشارة المطلوبة: {strengthFilter}%</div>
-              <input
-                type="range"
-                min="60"
-                max="90"
-                value={strengthFilter}
-                onChange={(e) => setStrengthFilter(parseInt(e.target.value))}
-                style={{ width: "100%" }}
-              />
-            </div>
-          </div>
-
-          {/* إشارات الدخول */}
-          <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 14 }}>
-            <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 12 }}>🔔 إشارات الدخول</div>
-            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 12 }}>
-              يتم إرسال إشارات قبل {SIGNAL_AHEAD_SECONDS} ثانية من الدخول المثالي
-            </div>
+            const tr1 = high - low;
+            const tr2 = Math.abs(high - prevClose);
+            const tr3 = Math.abs(low - prevClose);
             
-            {signals.length > 0 ? (
-              <div style={{ maxHeight: 180, overflowY: "auto" }}>
-                {signals.slice(0, 3).map((signal) => (
-                  <div key={signal.id} style={{ 
-                    background: signal.type === "BUY" ? "rgba(52, 211, 153, 0.15)" : "rgba(248, 113, 113, 0.15)",
-                    border: `1px solid ${signal.type === "BUY" ? theme.green : theme.red}`,
-                    borderRadius: 10,
-                    padding: 10,
-                    marginBottom: 8
-                  }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                      <div style={{ fontWeight: 900, fontSize: 13 }}>{signal.name}</div>
-                      <div style={{ 
-                        padding: "2px 8px", 
-                        borderRadius: 6, 
-                        background: signal.type === "BUY" ? theme.green : theme.red,
-                        color: "#fff",
-                        fontSize: 11,
-                        fontWeight: 700
-                      }}>
-                        {signal.type} {signal.type === "BUY" ? "⬆️" : "⬇️"}
-                      </div>
-                    </div>
-                    <div style={{ fontSize: 11, opacity: 0.9, marginBottom: 4 }}>{signal.reason}</div>
-                    <div style={{ fontSize: 10, display: "flex", justifyContent: "space-between", opacity: 0.8 }}>
-                      <span>الاحتمالية: {signal.probability}%</span>
-                      <span>قبل: {signal.timeAhead} ثانية</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div style={{ textAlign: "center", padding: "20px 0", opacity: 0.6, fontSize: 13 }}>
-                لا توجد إشارات دخول حالياً
-              </div>
-            )}
-          </div>
-        </div>
+            trueRanges.push(Math.max(tr1, tr2, tr3));
+        }
+        
+        return trueRanges.reduce((a, b) => a + b, 0) / trueRanges.length;
+    }
 
-        {/* البطاقات */}
-        <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 12 }}>
-          {cards.map((c) => {
-            const a = c.analysis || {};
-            const b = badge(a.color);
-            const conf = clamp(a.conf || 0, 0, 100);
+    static calculateBollingerBands(candles, period = 20, stdDev = 2) {
+        if (candles.length < period) return { upper: 0, middle: 0, lower: 0 };
+        
+        const slice = candles.slice(-period);
+        const closes = slice.map(c => c.close);
+        const middle = this.calculateSMA(slice);
+        
+        const variance = closes.reduce((acc, price) => 
+            acc + Math.pow(price - middle, 2), 0) / period;
+        const std = Math.sqrt(variance);
+        
+        return {
+            upper: middle + (std * stdDev),
+            middle,
+            lower: middle - (std * stdDev)
+        };
+    }
 
-            return (
-              <div
-                key={c.symbol}
-                style={{
-                  background: theme.card,
-                  border: `1px solid ${theme.border}`,
-                  borderRadius: 16,
-                  padding: 14,
-                  boxShadow: dark ? "0 10px 30px rgba(0,0,0,0.35)" : "0 8px 20px rgba(0,0,0,0.07)"
-                }}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
-                  <div>
-                    <div style={{ fontWeight: 900, fontSize: 16 }}>{c.name}</div>
-                    <div style={{ fontSize: 12, opacity: 0.75 }}>
-                      {c.symbol} {c.market ? `• ${c.market}` : ""}
-                    </div>
-                  </div>
+    static calculateMACD(candles) {
+        if (candles.length < 26) return { macd: 0, signal: 0, histogram: 0 };
+        
+        const ema12 = this.calculateEMA(candles, 12);
+        const ema26 = this.calculateEMA(candles, 26);
+        const macd = ema12 - ema26;
+        
+        // لحساب الإشارة نحتاج قيم MACD تاريخية
+        const macdValues = [];
+        const macdCandles = [];
+        
+        for (let i = 0; i < 9; i++) {
+            const start = Math.max(0, candles.length - 26 - i);
+            const slice = candles.slice(start, candles.length - i);
+            
+            if (slice.length >= 26) {
+                const currentMACD = this.calculateEMA(slice, 12) - 
+                                   this.calculateEMA(slice, 26);
+                macdValues.push(currentMACD);
+                macdCandles.push({ close: currentMACD });
+            }
+        }
+        
+        const signal = macdCandles.length >= 9 ? 
+            this.calculateEMA(macdCandles, 9) : macd;
+        
+        return {
+            macd,
+            signal,
+            histogram: macd - signal
+        };
+    }
+}
 
-                  <div style={{ padding: "6px 10px", borderRadius: 999, background: b.bg, color: b.fg, fontWeight: 900, fontSize: 12, whiteSpace: "nowrap" }}>
-                    {a.tag || "انتظر"}
-                  </div>
-                </div>
+// ===============================
+// 5. PRODUCTION DERIV WEBSOCKET (مع تصحيحات Memory Leak)
+// ===============================
+class ProductionDerivWebSocket {
+    constructor(appId) {
+        this.appId = appId;
+        this.ws = null;
+        this.connected = false;
+        this.reconnectDelay = 1000;
+        this.maxReconnectDelay = 30000;
+        this.subscriptions = new Map();
+        this.pendingRequests = new Map();
+        this.subscriptionIds = new Map();
+        this.subscriptionQueue = [];
+        this.processingQueue = false;
+        this.batchSize = 5;
+        this.batchDelay = 500;
+        this.pingInterval = null;
+        
+        // Session times (UTC)
+        this.sessions = {
+            london: { start: 7, end: 16 },
+            newyork: { start: 13, end: 22 }
+        };
+        
+        this.newsEvents = new Map();
+    }
 
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
-                  <div style={{ flex: "1 1 140px", background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 10 }}>
-                    <div style={{ fontSize: 12, opacity: 0.75 }}>السعر</div>
-                    <div style={{ fontSize: 18, fontWeight: 900, color: theme.blue }}>
-                      {typeof c.price === "number" ? c.price.toFixed(5) : "—"}
-                    </div>
-                  </div>
+    connect() {
+        this.ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${this.appId}`);
+        
+        this.ws.on('open', () => {
+            console.log('✅ Deriv WebSocket Connected');
+            this.connected = true;
+            this.reconnectDelay = 1000;
+            
+            this.pingInterval = setInterval(() => {
+                if (this.connected) {
+                    this.ws.send(JSON.stringify({ ping: 1 }));
+                }
+            }, 30000);
+            
+            this.processSubscriptionQueue();
+        });
 
-                  <div style={{ flex: "1 1 140px", background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 10 }}>
-                    <div style={{ fontSize: 12, opacity: 0.75 }}>الثقة</div>
-                    <div style={{ fontSize: 18, fontWeight: 900, color: a.color === "green" ? theme.green : a.color === "red" ? theme.red : theme.fg }}>
-                      {conf}%
-                    </div>
-                    <div style={{ height: 8, background: dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)", borderRadius: 99, overflow: "hidden", marginTop: 8 }}>
-                      <div style={{ width: `${conf}%`, height: "100%", background: a.color === "green" ? theme.green : a.color === "red" ? theme.red : theme.blue }} />
-                    </div>
-                  </div>
-                </div>
+        this.ws.on('message', (data) => {
+            try {
+                const message = JSON.parse(data);
+                
+                if (message.msg_type === 'ping') {
+                    this.ws.send(JSON.stringify({ pong: 1 }));
+                    return;
+                }
+                
+                if (message.echo_req?.req_id) {
+                    const callback = this.pendingRequests.get(message.echo_req.req_id);
+                    if (callback) {
+                        callback(message);
+                        this.pendingRequests.delete(message.echo_req.req_id);
+                    }
+                    return;
+                }
+                
+                if (message.msg_type === 'tick' && message.tick) {
+                    if (this.onTick) {
+                        this.onTick(message.tick);
+                    }
+                    
+                    if (message.subscription?.id) {
+                        this.subscriptionIds.set(message.tick.symbol, message.subscription.id);
+                    }
+                    return;
+                }
+                
+                if (message.error) {
+                    console.error('WebSocket Error:', message.error);
+                }
+                
+            } catch (error) {
+                console.error('❌ Error parsing WebSocket message:', error);
+            }
+        });
 
-                <div style={{ marginTop: 10, fontSize: 12, opacity: 0.85 }}>
-                  حالة السوق: <b>{a.market || "—"}</b> • تحديث: <b>{timeAgo(c.lastUpdate)}</b>
-                </div>
+        this.ws.on('close', () => this.handleDisconnect());
+        this.ws.on('error', (error) => console.error('WebSocket Error:', error));
+    }
 
-                <div style={{ marginTop: 10, background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 10 }}>
-                  <div style={{ fontWeight: 900, fontSize: 12, marginBottom: 6 }}>📊 أسباب الإشارة</div>
-                  <ul style={{ margin: 0, paddingRight: 18, lineHeight: 1.7, fontSize: 12 }}>
-                    {(a.reasons || []).slice(0, 4).map((r, i) => (
-                      <li key={i}>{r}</li>
-                    ))}
-                  </ul>
-                </div>
+    handleDisconnect() {
+        console.log('❌ WebSocket Disconnected');
+        this.connected = false;
+        this.subscriptionIds.clear();
+        this.pendingRequests.clear();
+        
+        if (this.pingInterval) {
+            clearInterval(this.pingInterval);
+        }
+        
+        this.reconnect();
+    }
 
-                {a.signals && a.signals.length > 0 && (
-                  <div style={{ marginTop: 10, background: a.color === "green" ? "rgba(52, 211, 153, 0.15)" : "rgba(248, 113, 113, 0.15)", border: `1px solid ${a.color === "green" ? theme.green : theme.red}`, borderRadius: 12, padding: 10 }}>
-                    <div style={{ fontWeight: 900, fontSize: 12, marginBottom: 6 }}>🚀 إشارات دخول</div>
-                    {a.signals.map((s, i) => (
-                      <div key={i} style={{ fontSize: 11, marginBottom: 4, opacity: 0.9 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between" }}>
-                          <span>نوع: <b>{s.type === "BUY" ? "شراء ⬆️" : "بيع ⬇️"}</b></span>
-                          <span>قبل: <b>{s.timeAhead} ثانية</b></span>
-                        </div>
-                        <div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>{s.reason}</div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+    reconnect() {
+        setTimeout(() => {
+            console.log(`🔄 Reconnecting in ${this.reconnectDelay}ms...`);
+            this.connect();
+            this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+        }, this.reconnectDelay);
+    }
+
+    sendRequest(request, callback) {
+        if (!this.connected) {
+            console.error('❌ WebSocket not connected');
+            if (callback) callback({ error: { code: 'NOT_CONNECTED' } });
+            return null;
+        }
+
+        const reqId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        request.req_id = reqId;
+        
+        this.pendingRequests.set(reqId, callback);
+        
+        // Timeout لمنع تراكم الطلبات المعلقة
+        setTimeout(() => {
+            if (this.pendingRequests.has(reqId)) {
+                this.pendingRequests.delete(reqId);
+                if (callback) {
+                    callback({ error: { code: 'TIMEOUT', message: 'Request timeout' } });
+                }
+            }
+        }, 15000);
+        
+        this.ws.send(JSON.stringify(request));
+        
+        return reqId;
+    }
+
+    subscribeTicks(symbol) {
+        if (this.subscriptionIds.has(symbol)) {
+            return true;
+        }
+
+        this.subscriptionQueue.push(symbol);
+        
+        if (!this.processingQueue) {
+            this.processSubscriptionQueue();
+        }
+        
+        return true;
+    }
+
+    async processSubscriptionQueue() {
+        if (this.processingQueue || !this.connected || this.subscriptionQueue.length === 0) {
+            return;
+        }
+
+        this.processingQueue = true;
+        
+        while (this.subscriptionQueue.length > 0) {
+            const batch = this.subscriptionQueue.splice(0, this.batchSize);
+            
+            await Promise.all(batch.map(symbol => 
+                new Promise(resolve => {
+                    setTimeout(() => {
+                        this.sendRequest({
+                            ticks: symbol,
+                            subscribe: 1
+                        }, (response) => {
+                            if (!response.error && response.subscription) {
+                                this.subscriptionIds.set(symbol, response.subscription.id);
+                                console.log(`📡 Subscribed to ${symbol}`);
+                            } else if (response.error) {
+                                console.error(`❌ Failed to subscribe to ${symbol}:`, response.error.message);
+                            }
+                            resolve();
+                        });
+                    }, Math.random() * 100);
+                })
+            ));
+            
+            if (this.subscriptionQueue.length > 0) {
+                await new Promise(resolve => setTimeout(resolve, this.batchDelay));
+            }
+        }
+        
+        this.processingQueue = false;
+    }
+
+    unsubscribeTicks(symbol) {
+        const subscriptionId = this.subscriptionIds.get(symbol);
+        if (!subscriptionId || !this.connected) return false;
+
+        this.sendRequest({
+            forget: subscriptionId
+        }, (response) => {
+            if (!response.error) {
+                this.subscriptionIds.delete(symbol);
+                console.log(`🔕 Unsubscribed from ${symbol}`);
+            }
+        });
+        
+        return true;
+    }
+
+    requestHistory(symbol, granularity = 60, count = 200) {
+        return new Promise((resolve) => {
+            this.sendRequest({
+                ticks_history: symbol,
+                adjust_start_time: 1,
+                count,
+                granularity,
+                style: "candles",
+                end: "latest"
+            }, (response) => {
+                resolve(response.candles || []);
+            });
+        });
+    }
+
+    isActiveSession() {
+        const now = new Date();
+        const utcHour = now.getUTCHours();
+        
+        const isLondonSession = utcHour >= this.sessions.london.start && utcHour < this.sessions.london.end;
+        const isNewYorkSession = utcHour >= this.sessions.newyork.start && utcHour < this.sessions.newyork.end;
+        
+        return isLondonSession || isNewYorkSession;
+    }
+
+    async loadNewsEvents() {
+        // Stub implementation - يمكنك ربطه بـ API حقيقي لاحقاً
+        this.newsEvents = new Map();
+        console.log('📰 News events: disabled (stub implementation)');
+    }
+
+    hasHighImpactNews(symbol, minutesBuffer = 30) {
+        // Stub implementation
+        return false;
+    }
+}
+
+// ===============================
+// 6. HISTORY QUEUE
+// ===============================
+class HistoryQueue {
+    constructor(ws, onHistoryLoaded) {
+        this.ws = ws;
+        this.queue = [];
+        this.processing = false;
+        this.onHistoryLoaded = onHistoryLoaded;
+        this.delay = 250;
+        this.concurrent = 3;
+    }
+
+    add(symbolStore) {
+        this.queue.push(symbolStore);
+        if (!this.processing) {
+            this.processBatch();
+        }
+    }
+
+    async processBatch() {
+        if (this.processing || this.queue.length === 0) {
+            return;
+        }
+
+        this.processing = true;
+        const batch = this.queue.splice(0, this.concurrent);
+
+        await Promise.all(batch.map(symbolStore => 
+            this.loadSymbolHistory(symbolStore)
+        ));
+
+        this.processing = false;
+        
+        if (this.queue.length > 0) {
+            setTimeout(() => this.processBatch(), this.delay);
+        }
+    }
+
+    async loadSymbolHistory(symbolStore) {
+        try {
+            console.log(`📥 Loading history for ${symbolStore.symbol}`);
+            const candles = await this.ws.requestHistory(symbolStore.symbol);
+            
+            if (candles && candles.length > 0) {
+                symbolStore.candles = candles.map(c => ({
+                    start: c.epoch * 1000,
+                    open: parseFloat(c.open),
+                    high: parseFloat(c.high),
+                    low: parseFloat(c.low),
+                    close: parseFloat(c.close),
+                    volume: parseFloat(c.volume)
+                })).slice(-200);
+                
+                if (symbolStore.candles.length > 0) {
+                    symbolStore.lastCandle = symbolStore.candles[symbolStore.candles.length - 1];
+                }
+                
+                console.log(`✅ History loaded for ${symbolStore.symbol}: ${symbolStore.candles.length} candles`);
+                
+                if (this.onHistoryLoaded) {
+                    this.onHistoryLoaded(symbolStore);
+                }
+            }
+        } catch (error) {
+            console.error(`❌ Error loading history for ${symbolStore.symbol}:`, error.message);
+        }
+    }
+}
+
+// ===============================
+// 7. ADVANCED STRATEGY ENGINE (مع تصحيح RSI)
+// ===============================
+class AdvancedStrategyEngine {
+    constructor(symbolStore) {
+        this.store = symbolStore;
+        this.compressionData = {
+            zoneStart: null,
+            zoneHigh: -Infinity,
+            zoneLow: Infinity,
+            zoneVolume: 0,
+            zoneCandleCount: 0,
+            isCompressed: false,
+            confirmedBreakout: false,
+            breakoutDirection: null,
+            breakoutTime: null
+        };
+        this.learningData = {
+            successfulSignals: 0,
+            totalSignals: 0,
+            winRate: 0,
+            avgProfit: 0,
+            confidenceAdjustment: 1.0
+        };
+    }
+
+    analyze() {
+        const candles = this.store.candles;
+        if (candles.length < 50) {
+            return { state: 'WAIT', confidence: 0 };
+        }
+
+        this.updateLearningData();
+        this.updateCompressionZone(candles.slice(-20));
+        
+        // تصحيح RSI: نستخدم 15 شمعة للحصول على 14 تغيير
+        const rsi = TechnicalAnalysis.calculateRSI(candles, 14);
+        const sma20 = TechnicalAnalysis.calculateSMA(candles.slice(-20));
+        const sma50 = TechnicalAnalysis.calculateSMA(candles.slice(-50));
+        const bb = TechnicalAnalysis.calculateBollingerBands(candles.slice(-20));
+        const macd = TechnicalAnalysis.calculateMACD(candles);
+        const atr = TechnicalAnalysis.calculateATR(candles);
+        
+        const lastPrice = candles[candles.length - 1].close;
+        const lastCandle = candles[candles.length - 1];
+        const prevCandle = candles[candles.length - 2] || lastCandle;
+        
+        const bbPosition = (lastPrice - bb.lower) / (bb.upper - bb.lower);
+        const primaryTrend = sma20 > sma50 ? 'BULLISH' : 'BEARISH';
+        const trendStrength = Math.abs(sma20 - sma50) / lastPrice;
+        
+        const compressionAnalysis = this.analyzeCompression(candles);
+        const fakeoutAnalysis = this.analyzeFakeout(candles.slice(-10));
+        
+        const conditions = {
+            isInCompression: this.compressionData.isCompressed && 
+                           compressionAnalysis.rangeRatio < 0.005,
+            
+            volumeDecreasing: compressionAnalysis.volumeTrend < -0.2,
+            
+            rsiNeutral: rsi > 45 && rsi < 55,
+            
+            noRecentFakeout: !fakeoutAnalysis.hasFakeout,
+            
+            potentialBreakout: this.checkPotentialBreakout(lastCandle, prevCandle, bb),
+            
+            trendAlignment: this.checkTrendAlignment(lastCandle, primaryTrend, macd),
+            
+            bollingerSqueeze: (bb.upper - bb.lower) / lastPrice < 0.01,
+            
+            macdAlignment: (primaryTrend === 'BULLISH' && macd.histogram > 0) ||
+                          (primaryTrend === 'BEARISH' && macd.histogram < 0),
+            
+            volumeSpike: lastCandle.volume > this.calculateAverageVolume(candles.slice(-10)) * 1.5,
+            
+            atrLow: atr / lastPrice < 0.001
+        };
+        
+        const weights = this.calculateDynamicWeights(conditions, lastCandle);
+        let rawConfidence = 0;
+        
+        Object.keys(conditions).forEach(key => {
+            if (conditions[key]) rawConfidence += weights[key];
+        });
+        
+        let confidence = rawConfidence * this.learningData.confidenceAdjustment;
+        
+        let state = 'WAIT';
+        let watchStrength = 0;
+        
+        const watchConditions = [
+            conditions.isInCompression,
+            conditions.volumeDecreasing,
+            conditions.rsiNeutral,
+            conditions.noRecentFakeout
+        ];
+        
+        const strongWatchConditions = [
+            conditions.bollingerSqueeze,
+            conditions.atrLow,
+            conditions.macdAlignment
+        ];
+        
+        const watchScore = watchConditions.filter(Boolean).length;
+        const strongWatchScore = strongWatchConditions.filter(Boolean).length;
+        
+        if (watchScore >= 3) {
+            state = 'WATCH';
+            watchStrength = 1;
+            
+            if (strongWatchScore >= 2 && watchScore >= 4) {
+                watchStrength = 2;
+                confidence += 15;
+            }
+        }
+        
+        const readyConditions = [
+            this.compressionData.confirmedBreakout,
+            conditions.potentialBreakout,
+            conditions.trendAlignment,
+            conditions.volumeSpike,
+            this.checkBreakoutConfirmation(lastCandle, prevCandle, bb)
+        ];
+        
+        const readyScore = readyConditions.filter(Boolean).length;
+        
+        if (readyScore >= 4 && watchStrength >= 1) {
+            state = 'READY';
+            confidence = Math.min(confidence + 20, 95);
+        }
+        
+        if (state === 'READY' && watchStrength < 1) {
+            state = 'WATCH';
+            confidence -= 10;
+        }
+        
+        if (this.store.hasHighImpactNews) {
+            state = 'WAIT';
+            confidence *= 0.7;
+        }
+        
+        if (!this.store.isActiveSessionTime) {
+            confidence *= 0.8;
+        }
+        
+        return {
+            state,
+            watchStrength,
+            confidence: Math.round(confidence),
+            direction: this.getDirection(lastCandle, primaryTrend, macd),
+            rsi: Math.round(rsi),
+            sma20: sma20.toFixed(5),
+            sma50: sma50.toFixed(5),
+            price: lastPrice.toFixed(5),
+            compression: this.compressionData.isCompressed,
+            compressionRange: compressionAnalysis.rangeRatio,
+            fakeoutAlert: fakeoutAnalysis.hasFakeout,
+            bollingerWidth: (bb.upper - bb.lower) / lastPrice, // رقم وليس نص
+            atrPct: (atr / lastPrice) * 100, // رقم وليس نص
+            macdHistogram: macd.histogram.toFixed(5),
+            reasons: this.generateAdvancedReasons(conditions, compressionAnalysis, fakeoutAnalysis),
+            entryTime: this.calculateSmartEntryTime(lastCandle, state),
+            sessionFiltered: !this.store.isActiveSessionTime,
+            newsFiltered: this.store.hasHighImpactNews
+        };
+    }
+    
+    updateLearningData() {
+        if (this.learningData.totalSignals > 10) {
+            this.learningData.winRate = this.learningData.successfulSignals / this.learningData.totalSignals;
+            
+            if (this.learningData.winRate > 0.6) {
+                this.learningData.confidenceAdjustment = 1.1;
+            } else if (this.learningData.winRate < 0.4) {
+                this.learningData.confidenceAdjustment = 0.9;
+            } else {
+                this.learningData.confidenceAdjustment = 1.0;
+            }
+        }
+    }
+    
+    calculateDynamicWeights(conditions, lastCandle) {
+        const baseWeights = {
+            isInCompression: 20,
+            volumeDecreasing: 15,
+            rsiNeutral: 10,
+            noRecentFakeout: 15,
+            potentialBreakout: 20,
+            trendAlignment: 10,
+            bollingerSqueeze: 12,
+            macdAlignment: 8,
+            volumeSpike: 15,
+            atrLow: 10
+        };
+        
+        const candleSize = (lastCandle.high - lastCandle.low) / lastCandle.low;
+        if (candleSize > 0.005) {
+            baseWeights.volumeSpike += 5;
+            baseWeights.trendAlignment += 5;
+        }
+        
+        return baseWeights;
+    }
+    
+    updateCompressionZone(recentCandles) {
+        if (recentCandles.length < 10) return;
+        
+        let high = -Infinity;
+        let low = Infinity;
+        let totalVolume = 0;
+        let totalRange = 0;
+        
+        recentCandles.forEach(candle => {
+            high = Math.max(high, candle.high);
+            low = Math.min(low, candle.low);
+            totalVolume += candle.volume;
+            totalRange += (candle.high - candle.low);
+        });
+        
+        const avgRange = totalRange / recentCandles.length;
+        const rangeRatio = (high - low) / low;
+        
+        this.compressionData.zoneHigh = high;
+        this.compressionData.zoneLow = low;
+        this.compressionData.zoneVolume = totalVolume;
+        this.compressionData.zoneCandleCount = recentCandles.length;
+        this.compressionData.isCompressed = rangeRatio < 0.008 && avgRange < (totalRange / 20) * 0.6;
+        
+        const lastCandle = recentCandles[recentCandles.length - 1];
+        if (this.compressionData.isCompressed) {
+            if (lastCandle.close > high || lastCandle.close < low) {
+                this.compressionData.confirmedBreakout = true;
+                this.compressionData.breakoutDirection = lastCandle.close > high ? 'BULLISH' : 'BEARISH';
+                this.compressionData.breakoutTime = Date.now();
+            }
+        } else {
+            this.compressionData.confirmedBreakout = false;
+        }
+    }
+    
+    analyzeCompression(candles) {
+        const range = this.compressionData.zoneHigh - this.compressionData.zoneLow;
+        const midPrice = (this.compressionData.zoneHigh + this.compressionData.zoneLow) / 2;
+        const rangeRatio = range / midPrice;
+        
+        if (candles.length >= 10) {
+            const first5Volume = candles.slice(-10, -5).reduce((sum, c) => sum + c.volume, 0) / 5;
+            const last5Volume = candles.slice(-5).reduce((sum, c) => sum + c.volume, 0) / 5;
+            const volumeTrend = (last5Volume - first5Volume) / first5Volume;
+            
+            return {
+                rangeRatio,
+                volumeTrend,
+                isStrongCompression: rangeRatio < 0.005 && volumeTrend < -0.3
+            };
+        }
+        
+        return { rangeRatio, volumeTrend: 0, isStrongCompression: false };
+    }
+    
+    analyzeFakeout(recentCandles) {
+        if (recentCandles.length < 5) return { hasFakeout: false };
+        
+        let fakeoutCount = 0;
+        for (let i = 1; i < recentCandles.length - 1; i++) {
+            const prev = recentCandles[i-1];
+            const current = recentCandles[i];
+            const next = recentCandles[i+1];
+            
+            if ((current.close > prev.high && next.close < prev.high) ||
+                (current.close < prev.low && next.close > prev.low)) {
+                fakeoutCount++;
+            }
+        }
+        
+        return {
+            hasFakeout: fakeoutCount > 0,
+            fakeoutCount,
+            fakeoutRatio: fakeoutCount / (recentCandles.length - 2)
+        };
+    }
+    
+    checkPotentialBreakout(currentCandle, prevCandle, bb) {
+        if (!this.compressionData.isCompressed) return false;
+        
+        const zoneHigh = this.compressionData.zoneHigh;
+        const zoneLow = this.compressionData.zoneLow;
+        const position = (currentCandle.close - zoneLow) / (zoneHigh - zoneLow);
+        
+        const nearEdge = position > 0.7 || position < 0.3;
+        const increasingVolume = currentCandle.volume > prevCandle.volume * 1.2;
+        const closingStrong = Math.abs(currentCandle.close - currentCandle.open) > 
+                            (currentCandle.high - currentCandle.low) * 0.6;
+        const nearBollinger = currentCandle.close > bb.upper * 0.98 || 
+                             currentCandle.close < bb.lower * 1.02;
+        
+        return nearEdge && increasingVolume && closingStrong && nearBollinger;
+    }
+    
+    checkTrendAlignment(candle, primaryTrend, macd) {
+        const isBullishCandle = candle.close > candle.open;
+        const candleStrength = Math.abs(candle.close - candle.open) / (candle.high - candle.low);
+        
+        if (primaryTrend === 'BULLISH') {
+            return isBullishCandle && candleStrength > 0.4 && macd.histogram > -0.0001;
+        } else {
+            return !isBullishCandle && candleStrength > 0.4 && macd.histogram < 0.0001;
+        }
+    }
+    
+    checkBreakoutConfirmation(currentCandle, prevCandle, bb) {
+        if (!this.compressionData.confirmedBreakout) return false;
+        
+        const breakoutDir = this.compressionData.breakoutDirection;
+        const zoneHigh = this.compressionData.zoneHigh;
+        const zoneLow = this.compressionData.zoneLow;
+        
+        if (breakoutDir === 'BULLISH') {
+            return currentCandle.close > zoneHigh && 
+                   currentCandle.close > currentCandle.open &&
+                   currentCandle.volume > prevCandle.volume &&
+                   currentCandle.close > bb.middle;
+        } else {
+            return currentCandle.close < zoneLow && 
+                   currentCandle.close < currentCandle.open &&
+                   currentCandle.volume > prevCandle.volume &&
+                   currentCandle.close < bb.middle;
+        }
+    }
+    
+    getDirection(candle, primaryTrend, macd) {
+        if (this.compressionData.confirmedBreakout) {
+            return this.compressionData.breakoutDirection === 'BULLISH' ? 'CALL' : 'PUT';
+        }
+        
+        if (this.compressionData.isCompressed) {
+            const potential = this.checkPotentialBreakout(candle, 
+                this.store.candles[this.store.candles.length - 2] || candle, 
+                TechnicalAnalysis.calculateBollingerBands(this.store.candles.slice(-20))
             );
-          })}
-        </div>
+            
+            return potential ? 
+                (candle.close > (this.compressionData.zoneHigh + this.compressionData.zoneLow) / 2 ? 'CALL' : 'PUT') : 
+                'WAIT';
+        }
+        
+        if (primaryTrend === 'BULLISH' && macd.histogram > 0) return 'CALL';
+        if (primaryTrend === 'BEARISH' && macd.histogram < 0) return 'PUT';
+        
+        return primaryTrend === 'BULLISH' ? 'CALL' : 'PUT';
+    }
+    
+    calculateSmartEntryTime(currentCandle, state) {
+        const now = Date.now();
+        const currentMinute = Math.floor(now / 60000);
+        
+        if (state === 'WATCH') {
+            const minutesToNextCandle = 60 - (Math.floor(now / 1000) % 60) / 60;
+            return Math.max(1, Math.ceil(minutesToNextCandle));
+        }
+        
+        if (state === 'READY') {
+            const nextCandleStart = (currentMinute + 1) * 60000;
+            const minutesToEntry = Math.ceil((nextCandleStart - now) / 60000);
+            return Math.max(1, minutesToEntry);
+        }
+        
+        return 0;
+    }
+    
+    calculateAverageVolume(candles) {
+        if (candles.length === 0) return 0;
+        return candles.reduce((acc, c) => acc + c.volume, 0) / candles.length;
+    }
+    
+    generateAdvancedReasons(conditions, compression, fakeout) {
+        const reasons = [];
+        
+        if (conditions.isInCompression) {
+            reasons.push(`ضغط قوي (نطاق: ${(compression.rangeRatio*100).toFixed(2)}%)`);
+        }
+        
+        if (conditions.volumeDecreasing) {
+            reasons.push('حجم متضائل قبل الكسر');
+        }
+        
+        if (conditions.noRecentFakeout && fakeout.fakeoutCount === 0) {
+            reasons.push('لا يوجد كسور كاذبة حديثة');
+        }
+        
+        if (conditions.bollingerSqueeze) {
+            reasons.push('نطاق بولنجر مضغوط');
+        }
+        
+        if (conditions.potentialBreakout) {
+            reasons.push('إشارات كسر محتمل قوية');
+        }
+        
+        if (conditions.macdAlignment) {
+            reasons.push('توافق MACD مع الاتجاه');
+        }
+        
+        if (this.compressionData.confirmedBreakout) {
+            reasons.push(`كسر مؤكد ${this.compressionData.breakoutDirection === 'BULLISH' ? 'صاعد' : 'هابط'}`);
+        }
+        
+        return reasons.slice(0, 3);
+    }
+}
 
-        {/* تذييل */}
-        <div style={{ marginTop: 16, padding: 12, borderRadius: 14, background: dark ? "rgba(239,68,68,0.10)" : "#fef2f2", border: `1px solid ${theme.red}`, color: theme.red, fontSize: 12, lineHeight: 1.7 }}>
-          ⚠️ هذا السكّانر للتحليل التعليمي فقط. التداول مسؤوليتك الكاملة.
-          <br />
-          ✅ يتم إرسال إشارات الدخول قبل {SIGNAL_AHEAD_SECONDS} ثانية لتتمكن من التحضير للصفقة.
-        </div>
-      </div>
-    </div>
-  );
+// ===============================
+// 8. PRODUCTION TRADING MONITOR (مع كل التصحيحات)
+// ===============================
+class ProductionTradingMonitor {
+    constructor() {
+        this.appId = process.env.DERIV_APP_ID;
+        this.ws = new ProductionDerivWebSocket(this.appId);
+        this.telegram = new TelegramSender();
+        this.symbolStores = new Map();
+        this.historyQueue = null;
+        this.analysisInterval = null;
+        
+        // إصلاح: startTime مفقود
+        this.startTime = Date.now();
+        
+        // إصلاح: totalSignals مفقود
+        this.performanceStats = {
+            signalsSent: 0,
+            successfulSignals: 0,
+            totalSignals: 0, // ✅ أضيف
+            winRate: 0,
+            fakeoutsDetected: 0,
+            compressionsFound: 0,
+            falsePositives: 0,
+            sessionFiltered: 0,
+            newsFiltered: 0
+        };
+        
+        // إصلاح: للتقارير المنتظمة
+        this.lastReportTime = 0;
+        this.lastHourlyReportTime = 0;
+        
+        this.setupWebSocketHandlers();
+        this.initialize();
+    }
+    
+    setupWebSocketHandlers() {
+        this.ws.onTick = (tick) => this.handleTick(tick);
+    }
+
+    async initialize() {
+        console.log('🚀 Starting Production Trading Monitor v2.1 (Corrected)...');
+        
+        await this.ws.loadNewsEvents();
+        this.ws.connect();
+        
+        await this.waitForConnection();
+        const symbols = await this.loadSymbols();
+        
+        this.historyQueue = new HistoryQueue(this.ws, (symbolStore) => {
+            setTimeout(() => {
+                this.ws.subscribeTicks(symbolStore.symbol);
+            }, Math.random() * 5000);
+            
+            this.analyzeSymbol(symbolStore);
+        });
+        
+        await this.createSymbolStores(symbols);
+        this.startAnalysisScheduler();
+        this.startPerformanceMonitor();
+        this.startSessionMonitor();
+        
+        console.log(`🎯 Production System Active: ${symbols.length} symbols`);
+    }
+    
+    async waitForConnection() {
+        return new Promise((resolve) => {
+            const checkConnection = setInterval(() => {
+                if (this.ws.connected) {
+                    clearInterval(checkConnection);
+                    resolve();
+                }
+            }, 100);
+        });
+    }
+    
+    async loadSymbols() {
+        return new Promise((resolve) => {
+            this.ws.sendRequest({
+                active_symbols: "brief",
+                product_type: "basic"
+            }, (response) => {
+                if (response.msg_type === 'active_symbols') {
+                    const symbols = response.active_symbols
+                        .filter(sym => {
+                            const market = sym.market.toLowerCase();
+                            const isAllowed = market.includes('forex') || 
+                                             market.includes('crypto') || 
+                                             market.includes('commodit');
+                            const isOTC = sym.display_name.includes('OTC') || 
+                                         sym.symbol.includes('OTC') ||
+                                         sym.symbol.includes('_OTC');
+                            return isAllowed && !isOTC;
+                        })
+                        .map(sym => ({
+                            symbol: sym.symbol,
+                            display_name: sym.display_name,
+                            market: sym.market,
+                            pip: sym.pip
+                            // إصلاح: لا نخزن session/news هنا
+                        }));
+                    
+                    resolve(symbols);
+                }
+            });
+        });
+    }
+    
+    async createSymbolStores(symbols) {
+        const batchSize = 10;
+        for (let i = 0; i < symbols.length; i += batchSize) {
+            const batch = symbols.slice(i, i + batchSize);
+            
+            await Promise.all(batch.map(async (symbolInfo) => {
+                const store = new SymbolStore(symbolInfo);
+                this.symbolStores.set(symbolInfo.symbol, store);
+                this.historyQueue.add(store);
+            }));
+            
+            if (i + batchSize < symbols.length) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+    }
+    
+    handleTick(tick) {
+        const symbolStore = this.symbolStores.get(tick.symbol);
+        if (!symbolStore) return;
+        
+        const isNewCandle = symbolStore.updateCandle(tick);
+        
+        if (isNewCandle) {
+            this.analyzeSymbol(symbolStore);
+        }
+    }
+    
+    analyzeSymbol(symbolStore) {
+        const now = Date.now();
+        
+        if (now - symbolStore.lastAnalysisTime < 15000) {
+            return;
+        }
+        
+        symbolStore.lastAnalysisTime = now;
+        
+        // إصلاح: تحديث session/news في كل تحليل
+        symbolStore.isActiveSessionTime = this.ws.isActiveSession();
+        symbolStore.hasHighImpactNews = this.ws.hasHighImpactNews(symbolStore.symbol);
+        
+        const engine = new AdvancedStrategyEngine(symbolStore);
+        const analysis = engine.analyze();
+        
+        symbolStore.analysis = analysis;
+        symbolStore.state = analysis.state;
+        
+        if (analysis.compression) this.performanceStats.compressionsFound++;
+        if (analysis.fakeoutAlert) this.performanceStats.fakeoutsDetected++;
+        if (analysis.sessionFiltered) this.performanceStats.sessionFiltered++;
+        if (analysis.newsFiltered) this.performanceStats.newsFiltered++;
+        
+        if (analysis.state === 'READY' && analysis.confidence >= 75) {
+            this.sendSignal(symbolStore, analysis, engine);
+        }
+    }
+    
+    async sendSignal(symbolStore, analysis, engine) {
+        const signalHash = this.generateSignalHash(symbolStore, analysis);
+        
+        if (symbolStore.lastSignalHash === signalHash && 
+            Date.now() - symbolStore.lastSignalTime < 2 * 60 * 60 * 1000) {
+            return;
+        }
+        
+        if (!this.confirmWithPreviousCandle(symbolStore, analysis)) {
+            this.performanceStats.falsePositives++;
+            return;
+        }
+        
+        const message = this.createProductionTelegramMessage(symbolStore, analysis);
+        
+        const sent = await this.telegram.sendTelegram(message, symbolStore.symbol, signalHash);
+        
+        if (sent) {
+            symbolStore.lastSignalHash = signalHash;
+            symbolStore.lastSignalTime = Date.now();
+            symbolStore.cooldownUntil = Date.now() + 30 * 60 * 1000;
+            
+            this.performanceStats.signalsSent++;
+            this.logProductionSignal(symbolStore, analysis, signalHash);
+            
+            setTimeout(() => {
+                this.evaluateSignal(symbolStore, analysis);
+            }, 5 * 60 * 1000);
+        }
+    }
+    
+    generateSignalHash(symbolStore, analysis) {
+        const recentCandles = symbolStore.candles.slice(-3);
+        const candlePattern = recentCandles.map(c => 
+            `${c.close > c.open ? 'B' : 'S'}_${((c.high-c.low)/c.low*1000).toFixed(0)}`
+        ).join('-');
+        
+        return `${symbolStore.symbol}_${analysis.direction}_${analysis.confidence}_${candlePattern}_${analysis.watchStrength}`;
+    }
+    
+    confirmWithPreviousCandle(symbolStore, analysis) {
+        const candles = symbolStore.candles;
+        if (candles.length < 3) return false;
+        
+        const current = candles[candles.length - 1];
+        const previous = candles[candles.length - 2];
+        
+        if (analysis.direction === 'CALL') {
+            return !(previous.close < previous.open && 
+                   Math.abs(previous.close - previous.open) > (previous.high - previous.low) * 0.7);
+        } else {
+            return !(previous.close > previous.open && 
+                   Math.abs(previous.close - previous.open) > (previous.high - previous.low) * 0.7);
+        }
+    }
+    
+    async evaluateSignal(symbolStore, originalAnalysis) {
+        try {
+            const currentPrice = await this.getCurrentPrice(symbolStore.symbol);
+            const entryPrice = parseFloat(originalAnalysis.price);
+            const direction = originalAnalysis.direction;
+            
+            let isSuccessful = false;
+            
+            if (direction === 'CALL') {
+                isSuccessful = currentPrice > entryPrice * 1.001;
+            } else {
+                isSuccessful = currentPrice < entryPrice * 0.999;
+            }
+            
+            if (isSuccessful) {
+                this.performanceStats.successfulSignals++;
+            }
+            
+            this.performanceStats.totalSignals++;
+            this.performanceStats.winRate = 
+                this.performanceStats.successfulSignals / this.performanceStats.totalSignals;
+            
+            console.log(`📊 Signal Evaluation: ${symbolStore.symbol} ${direction} - ${isSuccessful ? '✅ WIN' : '❌ LOSS'}`);
+            
+        } catch (error) {
+            console.error('❌ Error evaluating signal:', error.message);
+        }
+    }
+    
+    // إصلاح كبير: getCurrentPrice بدون memory leak
+    async getCurrentPrice(symbol) {
+        return new Promise((resolve) => {
+            let done = false;
+            let timeoutId = null;
+
+            this.ws.sendRequest({ 
+                ticks: symbol, 
+                subscribe: 1 
+            }, (response) => {
+                if (done) return;
+                done = true;
+                
+                if (timeoutId) clearTimeout(timeoutId);
+                
+                if (response.error) {
+                    console.error(`❌ Error getting price for ${symbol}:`, response.error);
+                    return resolve(0);
+                }
+
+                if (response.tick?.quote && response.subscription?.id) {
+                    const price = response.tick.quote;
+                    const subId = response.subscription.id;
+
+                    // إلغاء الاشتراك فوراً
+                    this.ws.sendRequest({ forget: subId }, () => {
+                        // تجاهل الرد
+                    });
+                    
+                    return resolve(price);
+                }
+                
+                resolve(0);
+            });
+
+            // Timeout للسلامة
+            timeoutId = setTimeout(() => {
+                if (!done) {
+                    done = true;
+                    console.error(`❌ Timeout getting price for ${symbol}`);
+                    resolve(0);
+                }
+            }, 10000);
+        });
+    }
+    
+    createProductionTelegramMessage(symbolStore, analysis) {
+        const entryText = analysis.entryTime === 1 ? 'بعد دقيقة واحدة' : 
+                         `بعد ${analysis.entryTime} دقائق`;
+        
+        const sessionWarning = analysis.sessionFiltered ? 
+            '\n⚠️ <b>ملاحظة:</b> خارج أوقات الجلسات الرئيسية' : '';
+        
+        const newsWarning = analysis.newsFiltered ? 
+            '\n⚠️ <b>تحذير:</b> توجد أخبار اقتصادية هامة قريبة' : '';
+        
+        return `🎯 <b>إشارة تداول - نظام متقدم</b>
+
+📊 <b>${symbolStore.name} (${symbolStore.symbol})</b>
+🏪 السوق: ${symbolStore.market}
+⏰ الجلسة: ${analysis.sessionFiltered ? 'غير رئيسية' : 'نشطة'}
+
+🚀 <b>الاتجاه: ${analysis.direction === 'CALL' ? 'شراء 📈' : 'بيع 📉'}</b>
+⏰ <b>الدخول: ${entryText}</b>
+⏳ المدة المقترحة: 1-2 دقيقة
+📈 الثقة: ${analysis.confidence}%
+
+🔍 <b>تحليل النمط:</b>
+${analysis.compression ? '✅ في منطقة ضغط' : '❌ لا يوجد ضغط'}
+${analysis.fakeoutAlert ? '⚠️ كسور كاذبة حديثة' : '✅ لا توجد كسور كاذبة'}
+نطاق بولنجر: ${(analysis.bollingerWidth * 100).toFixed(2)}%
+ATR: ${analysis.atrPct.toFixed(3)}%
+
+📋 <b>أسباب الإشارة:</b>
+${analysis.reasons.map((r, i) => `${i+1}. ${r}`).join('\n')}
+
+💰 <b>البيانات الفنية:</b>
+السعر: ${analysis.price}
+RSI: ${analysis.rsi}
+SMA20: ${analysis.sma20}
+SMA50: ${analysis.sma50}
+MACD: ${analysis.macdHistogram}
+
+${sessionWarning}${newsWarning}
+
+⚠️ <b>تعليمات التنفيذ:</b>
+1. انتظر بداية الشمعة الجديدة
+2. إذا فاتك 30 ثانية، تجاهل الإشارة
+3. استخدم وقف خسارة 1.5x الربح المستهدف
+4. هذه إشارة آلية تحتاج تأكيد بصري
+
+📊 <b>إحصائيات النظام:</b>
+• ${this.performanceStats.signalsSent} إشارة مرسلة
+• ${this.performanceStats.successfulSignals} إشارة ناجحة
+• Win Rate: ${(this.performanceStats.winRate * 100).toFixed(1)}%
+• ${this.performanceStats.compressionsFound} منطقة ضغط تم رصدها
+
+#${symbolStore.symbol.replace('.', '').slice(0, 6)}`;
+    }
+    
+    logProductionSignal(symbolStore, analysis, hash) {
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            symbol: symbolStore.symbol,
+            direction: analysis.direction,
+            confidence: analysis.confidence,
+            entryTime: analysis.entryTime,
+            price: analysis.price,
+            compression: analysis.compression,
+            fakeout: analysis.fakeoutAlert,
+            watchStrength: analysis.watchStrength || 0,
+            state: analysis.state,
+            sessionFiltered: analysis.sessionFiltered,
+            newsFiltered: analysis.newsFiltered,
+            hash: hash
+        };
+        
+        console.log('📝 Production Signal:', JSON.stringify(logEntry, null, 2));
+        this.saveToDatabase(logEntry);
+    }
+    
+    saveToDatabase(logEntry) {
+        // يمكنك تفعيل هذا لاحقاً
+        // fs.appendFileSync('signals.json', JSON.stringify(logEntry) + '\n');
+    }
+    
+    startAnalysisScheduler() {
+        this.analysisInterval = setInterval(() => {
+            const now = Date.now();
+            this.symbolStores.forEach(store => {
+                if (now - store.lastAnalysisTime > 30000) {
+                    this.analyzeSymbol(store);
+                }
+            });
+        }, 30000);
+    }
+    
+    startPerformanceMonitor() {
+        // إصلاح: استخدام طريقة time-based بدلاً من modulo
+        setInterval(() => {
+            const now = Date.now();
+            
+            // تقرير كل 5 دقائق
+            if (now - this.lastReportTime >= 5 * 60 * 1000) {
+                this.lastReportTime = now;
+                this.printPerformanceReport();
+            }
+            
+            // تقرير ساعي
+            if (now - this.lastHourlyReportTime >= 60 * 60 * 1000) {
+                this.lastHourlyReportTime = now;
+                this.printHourlyReport();
+            }
+            
+        }, 1000);
+    }
+    
+    printPerformanceReport() {
+        const stats = this.getPerformanceStats();
+        
+        console.log('\n📊 Performance Report (5min):');
+        console.log('============================');
+        console.log(`Uptime: ${this.formatUptime()}`);
+        console.log(`Active Symbols: ${stats.activeSymbols}`);
+        console.log(`WS Status: ${stats.wsConnected ? '✅' : '❌'}`);
+        console.log(`Signals Sent: ${stats.signalsSent}`);
+        console.log(`Win Rate: ${(stats.winRate * 100).toFixed(1)}%`);
+        console.log(`False Positives: ${stats.falsePositives}`);
+        console.log(`Session Filtered: ${stats.sessionFiltered}`);
+        console.log(`News Filtered: ${stats.newsFiltered}`);
+        console.log(`System Health: ${stats.winRate > 0.5 ? '✅ GOOD' : '⚠️ NEEDS ATTENTION'}`);
+        console.log('============================\n');
+        
+        if (stats.winRate < 0.4 && stats.signalsSent > 10) {
+            console.warn('⚠️ WARNING: System win rate is below 40%');
+        }
+    }
+    
+    printHourlyReport() {
+        const stats = this.getPerformanceStats();
+        const uptime = this.formatUptime();
+        
+        console.log('\n⏰ Hourly System Report:');
+        console.log('=======================');
+        console.log(`System Uptime: ${uptime}`);
+        console.log(`Total Signals: ${stats.signalsSent}`);
+        console.log(`Successful: ${stats.successfulSignals}`);
+        console.log(`Win Rate: ${(stats.winRate * 100).toFixed(1)}%`);
+        console.log(`Compressions Found: ${stats.compressionsFound}`);
+        console.log(`Fakeouts Detected: ${stats.fakeoutsDetected}`);
+        console.log(`Memory Usage: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
+        console.log('=======================\n');
+    }
+    
+    startSessionMonitor() {
+        setInterval(() => {
+            this.symbolStores.forEach(store => {
+                store.isActiveSessionTime = this.ws.isActiveSession();
+                store.hasHighImpactNews = this.ws.hasHighImpactNews(store.symbol);
+            });
+        }, 60 * 60 * 1000);
+    }
+    
+    formatUptime() {
+        const uptime = Date.now() - this.startTime;
+        const hours = Math.floor(uptime / (1000 * 60 * 60));
+        const minutes = Math.floor((uptime % (1000 * 60 * 60)) / (1000 * 60));
+        const seconds = Math.floor((uptime % (1000 * 60)) / 1000);
+        return `${hours}h ${minutes}m ${seconds}s`;
+    }
+    
+    getPerformanceStats() {
+        const totalSignals = this.performanceStats.totalSignals || 1;
+        const accuracyRate = this.performanceStats.signalsSent > 0 ? 
+            (this.performanceStats.signalsSent / (this.performanceStats.signalsSent + this.performanceStats.falsePositives) * 100).toFixed(1) : 0;
+        
+        return {
+            ...this.performanceStats,
+            accuracyRate,
+            activeSymbols: this.symbolStores.size,
+            wsConnected: this.ws.connected
+        };
+    }
+}
+
+// ===============================
+// 9. TRADING SYSTEM (مع تصحيحات التقارير)
+// ===============================
+class TradingSystem {
+    constructor(mode = 'production') {
+        this.mode = mode;
+        this.monitor = null;
+        this.startTime = Date.now();
+        this.testDuration = mode === 'test' ? 7 * 24 * 60 * 60 * 1000 : null;
+        this.lastTestReportTime = 0;
+    }
+    
+    async start() {
+        console.log(`🚀 Starting Trading System v2.1 in ${this.mode.toUpperCase()} mode`);
+        
+        try {
+            this.monitor = new ProductionTradingMonitor();
+            
+            if (this.mode === 'test') {
+                await this.runExtendedTest();
+            } else {
+                await this.runProduction();
+            }
+            
+        } catch (error) {
+            console.error('❌ System startup failed:', error);
+            process.exit(1);
+        }
+    }
+    
+    async runExtendedTest() {
+        console.log('🧪 Running EXTENDED TEST for 7 days...');
+        
+        const testInterval = setInterval(() => {
+            const now = Date.now();
+            const uptime = now - this.startTime;
+            
+            // تقرير ساعي
+            if (now - this.lastTestReportTime >= 60 * 60 * 1000) {
+                this.lastTestReportTime = now;
+                const stats = this.monitor.getPerformanceStats();
+                
+                console.log('\n🧪 Test Progress:');
+                console.log(`Uptime: ${Math.floor(uptime/(1000*60*60))}h`);
+                console.log(`Signals: ${stats.signalsSent}`);
+                console.log(`Win Rate: ${(stats.winRate * 100).toFixed(1)}%`);
+                console.log(`False Positives: ${stats.falsePositives}`);
+                console.log(`Accuracy: ${stats.accuracyRate}%`);
+            }
+            
+            // نهاية الاختبار
+            if (uptime > this.testDuration) {
+                clearInterval(testInterval);
+                this.generateTestReport();
+            }
+        }, 1000);
+    }
+    
+    async generateTestReport() {
+        const finalStats = this.monitor.getPerformanceStats();
+        
+        console.log('\n' + '='.repeat(50));
+        console.log('✅ 7-DAY TEST COMPLETED SUCCESSFULLY!');
+        console.log('='.repeat(50));
+        console.log(`Total Runtime: 7 days`);
+        console.log(`Signals Generated: ${finalStats.signalsSent}`);
+        console.log(`Successful Signals: ${finalStats.successfulSignals}`);
+        console.log(`Win Rate: ${(finalStats.winRate * 100).toFixed(1)}%`);
+        console.log(`Compression Zones Found: ${finalStats.compressionsFound}`);
+        console.log(`Fakeouts Detected: ${finalStats.fakeoutsDetected}`);
+        console.log(`False Positives: ${finalStats.falsePositives}`);
+        console.log(`Session Filtered: ${finalStats.sessionFiltered}`);
+        console.log(`News Filtered: ${finalStats.newsFiltered}`);
+        console.log(`Final Accuracy: ${finalStats.accuracyRate}%`);
+        console.log('='.repeat(50));
+        
+        if (finalStats.winRate > 0.55 && finalStats.signalsSent > 50) {
+            console.log('🎯 TEST PASSED: System ready for production!');
+            this.provideRecommendations(finalStats);
+            process.exit(0);
+        } else {
+            console.log('❌ TEST FAILED: Need strategy adjustments');
+            console.log('💡 Recommendations:');
+            console.log('1. Increase confidence threshold to 80%');
+            console.log('2. Add more confirmation filters');
+            console.log('3. Review compression zone parameters');
+            process.exit(1);
+        }
+    }
+    
+    provideRecommendations(stats) {
+        console.log('\n💡 Production Recommendations:');
+        
+        if (stats.winRate > 0.65) {
+            console.log('✅ Excellent win rate - Consider reducing cooldown to 20 minutes');
+        }
+        
+        if (stats.falsePositives > stats.signalsSent * 0.3) {
+            console.log('⚠️ High false positives - Increase confirmation requirements');
+        }
+        
+        if (stats.sessionFiltered > stats.signalsSent * 0.5) {
+            console.log('⚠️ Many signals filtered by session - Consider expanding session hours');
+        }
+        
+        console.log('📊 Optimal Configuration:');
+        console.log('- Confidence Threshold: 75%');
+        console.log('- Cooldown: 30 minutes');
+        console.log('- Session Filter: Enabled');
+        console.log('- News Filter: Enabled');
+    }
+    
+    async runProduction() {
+        console.log('🏭 Running in PRODUCTION mode');
+        
+        // إصلاح: استخدام time-based للتقارير
+        let lastProductionReport = 0;
+        
+        setInterval(() => {
+            const now = Date.now();
+            
+            if (now - lastProductionReport >= 5 * 60 * 1000) {
+                lastProductionReport = now;
+                const stats = this.monitor.getPerformanceStats();
+                const uptime = now - this.startTime;
+                
+                console.log('\n🏭 Production Status:');
+                console.log(`Uptime: ${Math.floor(uptime/(1000*60*60))}h ${Math.floor((uptime%(1000*60*60))/(1000*60))}m`);
+                console.log(`Active Symbols: ${stats.activeSymbols}`);
+                console.log(`WS Status: ${stats.wsConnected ? '✅' : '❌'}`);
+                console.log(`Total Signals: ${stats.signalsSent}`);
+                console.log(`Current Win Rate: ${(stats.winRate * 100).toFixed(1)}%`);
+                console.log(`System Health: ${stats.winRate > 0.5 ? '✅ GOOD' : '⚠️ NEEDS ATTENTION'}`);
+            }
+        }, 1000);
+    }
+}
+
+// ===============================
+// 10. MAIN EXECUTION
+// ===============================
+async function main() {
+    const mode = process.argv[2] || 'production';
+    
+    const requiredEnvVars = ['DERIV_APP_ID', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
+    const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+    
+    if (missingVars.length > 0) {
+        console.error('❌ Missing environment variables:', missingVars.join(', '));
+        console.error('Please create a .env file with:');
+        console.error('DERIV_APP_ID=your_app_id');
+        console.error('TELEGRAM_BOT_TOKEN=your_bot_token');
+        console.error('TELEGRAM_CHAT_ID=your_chat_id');
+        process.exit(1);
+    }
+    
+    const system = new TradingSystem(mode);
+    await system.start();
+}
+
+// ===============================
+// 11. EXPORTS (للاستخدام كـ module)
+// ===============================
+module.exports = {
+    ProductionTradingMonitor,
+    AdvancedStrategyEngine,
+    TechnicalAnalysis,
+    ProductionDerivWebSocket,
+    TradingSystem,
+    TelegramSender,
+    SymbolStore
+};
+
+// ===============================
+// 12. RUN IF EXECUTED DIRECTLY
+// ===============================
+if (require.main === module) {
+    main();
 }
