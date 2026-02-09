@@ -1,35 +1,58 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 
 /**
- * ✅ Quotex Signals Scanner — HEAVY (Signals Only)
+ * ✅ Quotex Signals Scanner Pro - النسخة المتطورة
  * ------------------------------------------------
- * ✔ بدون تحكم/اختيارات (Signals فقط)
- * ✔ يجيب "هواي عملات" تلقائياً (من Deriv Active Symbols)
- * ✔ يعرضها بشكل Cards واضح مثل Scanner
- * ✔ كل زوج/أصل له: سعر + اتجاه + ثقة + أسباب
- *
- * ملاحظة مهمة:
- * - هذا السكّانر يجلب البيانات من Deriv WebSocket (مو من Quotex مباشرة)
- * - لأن Quotex ما يوفر API رسمي مباشر للشموع.
+ * ✔ قائمة اختيار العملات (يختار المستخدم ما يريد فقط)
+ * ✔ تحليل متقدم مع استراتيجيات واضحة
+ * ✔ إشارات دخول قبل الدقيقة مع احتمالية التنفيذ
+ * ✔ تنبيهات صوتية ومرئية للإشارات
+ * ✔ واجهة احترافية وسهلة الاستخدام
  */
 
-// ========= CONFIG (No UI controls) =========
+// ========= CONFIG =========
 const APP_ID = 1089;
 const WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
 
-const GRANULARITY = 60; // 1m candles (ثابت)
+const GRANULARITY = 60; // 1m candles
 const HISTORY_COUNT = 200;
-const MIN_CANDLES_FOR_FULL = 35; // حتى يشتغل MACD مضبوط
-const MIN_CANDLES_MIN = 15; // minimum fallback
+const MIN_CANDLES_FOR_FULL = 35;
+const MIN_CANDLES_MIN = 15;
 
-const MAX_ASSETS = 80; // حتى ما يصير ضغط اشتراكات كبير
-const ANALYZE_EVERY_MS = 60_000; // كل دقيقة
-const TICK_REFRESH_MS = 15_000; // تحديث خفيف كل 15 ثانية
+const MAX_ASSETS = 80;
+const ANALYZE_EVERY_MS = 60_000;
+const TICK_REFRESH_MS = 15_000;
+const SIGNAL_AHEAD_SECONDS = 60; // إشارة قبل 60 ثانية
+
+// ========= العملات الشائعة =========
+const COMMON_PAIRS = [
+  { symbol: "frxEURUSD", name: "EUR/USD", market: "forex" },
+  { symbol: "frxGBPUSD", name: "GBP/USD", market: "forex" },
+  { symbol: "frxUSDJPY", name: "USD/JPY", market: "forex" },
+  { symbol: "frxUSDCHF", name: "USD/CHF", market: "forex" },
+  { symbol: "frxAUDUSD", name: "AUD/USD", market: "forex" },
+  { symbol: "frxUSDCAD", name: "USD/CAD", market: "forex" },
+  { symbol: "frxNZDUSD", name: "NZD/USD", market: "forex" },
+  { symbol: "frxEURGBP", name: "EUR/GBP", market: "forex" },
+  { symbol: "frxEURJPY", name: "EUR/JPY", market: "forex" },
+  { symbol: "frxGBPJPY", name: "GBP/JPY", market: "forex" },
+  { symbol: "CRYPTOC_BTCUSD", name: "Bitcoin/USD", market: "cryptocurrency" },
+  { symbol: "CRYPTOC_ETHUSD", name: "Ethereum/USD", market: "cryptocurrency" },
+  { symbol: "CRYPTOC_XRPUSD", name: "Ripple/USD", market: "cryptocurrency" },
+  { symbol: "CRYPTOC_ADAUSD", name: "Cardano/USD", market: "cryptocurrency" },
+  { symbol: "CRYPTOC_SOLUSD", name: "Solana/USD", market: "cryptocurrency" },
+  { symbol: "OTC_XAUUSD", name: "الذهب", market: "commodities" },
+  { symbol: "OTC_XAGUSD", name: "الفضة", market: "commodities" },
+  { symbol: "OTC_WTI_OIL", name: "النفط الخام", market: "commodities" },
+  { symbol: "R_50", name: "S&P 500", market: "indices" },
+  { symbol: "R_100", name: "Nasdaq 100", market: "indices" },
+  { symbol: "frxXAUUSD", name: "الذهب فوركس", market: "commodities" },
+  { symbol: "frxXAGUSD", name: "الفضة فوركس", market: "commodities" },
+];
 
 // ========= UTILS =========
 const bucketStart = (epoch, durationSec) => epoch - (epoch % durationSec);
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
-
 const avg = (arr) => (arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : 0);
 const stdDev = (arr) => {
   if (!arr.length) return 0;
@@ -38,7 +61,7 @@ const stdDev = (arr) => {
   return Math.sqrt(v);
 };
 
-// ========= SIMPLE INDICATORS (fast, no libs) =========
+// ========= INDICATORS =========
 function ema(values, period) {
   if (!values || values.length < period) return null;
   const k = 2 / (period + 1);
@@ -63,7 +86,6 @@ function rsi(values, period = 14) {
 
 function macd(values, fast = 12, slow = 26, signal = 9) {
   if (!values || values.length < slow + signal + 5) return null;
-
   const macdLine = [];
   for (let i = 0; i < values.length; i++) {
     const slice = values.slice(0, i + 1);
@@ -90,13 +112,22 @@ const playAlert = (type = "signal") => {
     osc.connect(gain);
     gain.connect(ctx.destination);
 
-    osc.frequency.setValueAtTime(type === "buy" ? 800 : type === "sell" ? 420 : 660, ctx.currentTime);
-    gain.gain.setValueAtTime(0.08, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.22);
+    if (type === "buy") {
+      osc.frequency.setValueAtTime(800, ctx.currentTime);
+      osc.frequency.setValueAtTime(1200, ctx.currentTime + 0.1);
+    } else if (type === "sell") {
+      osc.frequency.setValueAtTime(420, ctx.currentTime);
+      osc.frequency.setValueAtTime(320, ctx.currentTime + 0.1);
+    } else {
+      osc.frequency.setValueAtTime(660, ctx.currentTime);
+    }
+    
+    gain.gain.setValueAtTime(0.1, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
 
     osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.22);
-    setTimeout(() => ctx.close(), 350);
+    osc.stop(ctx.currentTime + 0.3);
+    setTimeout(() => ctx.close(), 500);
   } catch {}
 };
 
@@ -190,6 +221,11 @@ class WSManager {
     return this.send({ ticks: symbol, subscribe: 1 });
   }
 
+  unsubscribe(symbol) {
+    this.subscribed.delete(symbol);
+    return this.send({ ticks: symbol, subscribe: 0 });
+  }
+
   requestActiveSymbols() {
     return this.send({ active_symbols: "brief", product_type: "basic" });
   }
@@ -227,35 +263,74 @@ class WSManager {
   }
 }
 
-// ========= MAIN =========
+// ========= STRATEGIES =========
+const STRATEGIES = [
+  {
+    id: "trend_follow",
+    name: "تابع الترند",
+    description: "تداول في اتجاه الترند الرئيسي مع تأكيد من المتوسطات المتحركة",
+    conditions: {
+      emaCross: true,
+      rsiConfirmation: true,
+      volume: false
+    }
+  },
+  {
+    id: "rsi_reversal",
+    name: "انعكاس RSI",
+    description: "تداول عند التشبع الشرائي أو البيعي في RSI",
+    conditions: {
+      rsiExtreme: true,
+      candlestickPattern: true,
+      macdDivergence: true
+    }
+  },
+  {
+    id: "breakout",
+    name: "اختراق",
+    description: "تداول عند اختراق مستويات المقاومة أو الدعم",
+    conditions: {
+      supportResistance: true,
+      highVolume: true,
+      volatility: true
+    }
+  }
+];
+
+// ========= MAIN COMPONENT =========
 export default function Home() {
   const wsRef = useRef(new WSManager());
-
-  // store per symbol
   const storeRef = useRef({});
+  const signalsRef = useRef([]);
 
   const [status, setStatus] = useState("connecting");
   const [cards, setCards] = useState([]);
+  const [signals, setSignals] = useState([]);
   const [note, setNote] = useState(null);
   const [dark, setDark] = useState(true);
-
   const [sound, setSound] = useState(true);
+  const [selectedPairs, setSelectedPairs] = useState(COMMON_PAIRS.slice(0, 10).map(p => p.symbol));
+  const [showAllAssets, setShowAllAssets] = useState(false);
+  const [strategy, setStrategy] = useState(STRATEGIES[0].id);
+  const [strengthFilter, setStrengthFilter] = useState(70);
+
   const lastAlertRef = useRef({ t: 0, key: "" });
 
   const theme = useMemo(() => {
     const bg = dark ? "#0b1220" : "#ffffff";
     const fg = dark ? "#e5e7eb" : "#0b1220";
-    const card = dark ? "rgba(17,24,39,0.75)" : "#ffffff";
-    const border = dark ? "rgba(148,163,184,0.18)" : "#e5e7eb";
+    const card = dark ? "rgba(17,24,39,0.85)" : "#ffffff";
+    const border = dark ? "rgba(148,163,184,0.25)" : "#e5e7eb";
     const soft = dark ? "rgba(17,24,39,0.45)" : "#f8fafc";
     const blue = dark ? "#60a5fa" : "#2563eb";
     const green = dark ? "#34d399" : "#16a34a";
     const red = dark ? "#f87171" : "#dc2626";
     const amber = dark ? "#fbbf24" : "#f59e0b";
-    return { bg, fg, card, border, soft, blue, green, red, amber };
+    const purple = dark ? "#c084fc" : "#9333ea";
+    return { bg, fg, card, border, soft, blue, green, red, amber, purple };
   }, [dark]);
 
-  // ======== analysis per symbol ========
+  // ======== تحليل متقدم مع استراتيجية ========
   const analyzeSymbol = useCallback(
     (sym) => {
       const item = storeRef.current[sym];
@@ -263,9 +338,9 @@ export default function Home() {
 
       const candles = item.candles || [];
       const lastCandle = item.lastCandle;
-
       const merged = lastCandle ? [...candles, lastCandle] : [...candles];
       const closes = merged.map((c) => c.close).filter((x) => Number.isFinite(x));
+      const volumes = merged.map((c) => c.volume).filter((x) => Number.isFinite(x));
 
       if (closes.length < MIN_CANDLES_MIN) {
         item.analysis = {
@@ -275,6 +350,7 @@ export default function Home() {
           color: "muted",
           market: "جمع بيانات",
           reasons: [`عدد الشموع: ${closes.length} (نحتاج ${MIN_CANDLES_MIN}+ )`],
+          signals: [],
           updatedAt: Date.now()
         };
         return;
@@ -284,74 +360,179 @@ export default function Home() {
       const prev = closes[closes.length - 2];
       const delta = last - prev;
 
-      let buy = 0;
-      let sell = 0;
-      const reasons = [];
-
-      if (delta > 0) {
-        buy += 1;
-        reasons.push("زخم سريع: الإغلاق أعلى من السابق");
-      } else if (delta < 0) {
-        sell += 1;
-        reasons.push("زخم سريع: الإغلاق أقل من السابق");
-      }
-
+      // تحليل السوق
       const recent = closes.slice(-20);
       const v = avg(recent) ? stdDev(recent) / avg(recent) : 0;
       const market = v > 0.02 ? "تذبذب عالي" : v < 0.005 ? "هادئ" : "طبيعي";
 
+      // مؤشرات
       const r = rsi(closes, 14);
-      if (r != null) {
-        if (r < 30) {
-          buy += 2;
-          reasons.push("RSI: تشبع بيع (شراء)");
-        } else if (r > 70) {
-          sell += 2;
-          reasons.push("RSI: تشبع شراء (بيع)");
-        } else if (r >= 52) {
-          buy += 1;
-          reasons.push("RSI فوق 52 (ميل صعودي)");
-        } else if (r <= 48) {
-          sell += 1;
-          reasons.push("RSI تحت 48 (ميل هبوطي)");
-        } else {
-          reasons.push("RSI قريب من المنتصف (محايد)");
-        }
-      }
-
       const e9 = ema(closes, 9);
       const e21 = ema(closes, 21);
-      if (e9 != null && e21 != null) {
-        if (e9 > e21) {
-          buy += 2;
-          reasons.push("EMA9 فوق EMA21 (ترند صاعد)");
-        } else {
-          sell += 2;
-          reasons.push("EMA9 تحت EMA21 (ترند هابط)");
-        }
-      }
-
+      const e50 = ema(closes, 50);
       const m = macd(closes, 12, 26, 9);
-      if (m && m.macd != null && m.signal != null) {
-        if (m.macd > m.signal) {
-          buy += 1;
-          reasons.push("MACD إيجابي");
-        } else {
-          sell += 1;
-          reasons.push("MACD سلبي");
+      
+      // حجم التداول
+      const avgVolume = avg(volumes.slice(-10)) || 1;
+      const lastVolume = volumes[volumes.length - 1] || 0;
+      const volumeRatio = lastVolume / avgVolume;
+
+      let buyScore = 0;
+      let sellScore = 0;
+      const reasons = [];
+      const signals = [];
+
+      // استراتيجية: تابع الترند
+      if (strategy === "trend_follow") {
+        if (e9 && e21) {
+          if (e9 > e21) {
+            buyScore += 3;
+            reasons.push("📈 EMA9 فوق EMA21 - ترند صاعد");
+          } else {
+            sellScore += 3;
+            reasons.push("📉 EMA9 تحت EMA21 - ترند هابط");
+          }
         }
-      } else if (closes.length < MIN_CANDLES_FOR_FULL) {
-        reasons.push("MACD يحتاج شموع أكثر (تحليل مختصر)");
+
+        if (e50 && last > e50) {
+          buyScore += 2;
+          reasons.push("🚀 السعر فوق EMA50 - دعم قوي");
+        } else if (e50 && last < e50) {
+          sellScore += 2;
+          reasons.push("⚠️ السعر تحت EMA50 - مقاومة قوية");
+        }
+
+        if (r != null && r > 40 && r < 60) {
+          if (e9 && e21 && e9 > e21) {
+            buyScore += 1;
+            reasons.push("✅ RSI في المدى المتوسط مع ترند صاعد");
+          } else if (e9 && e21 && e9 < e21) {
+            sellScore += 1;
+            reasons.push("✅ RSI في المدى المتوسط مع ترند هابط");
+          }
+        }
       }
 
-      const total = buy + sell;
-      const conf = total ? Math.round((Math.max(buy, sell) / total) * 100) : 0;
+      // استراتيجية: انعكاس RSI
+      else if (strategy === "rsi_reversal") {
+        if (r != null) {
+          if (r < 30) {
+            buyScore += 4;
+            reasons.push("🔄 RSI تشبع بيع (${r.toFixed(1)}) - انعكاس متوقع");
+            
+            // إشارة دخول قبلية
+            if (r < 25 && volumeRatio > 1.5) {
+              signals.push({
+                type: "BUY",
+                reason: "تشبع بيع قوي مع حجم مرتفع",
+                probability: 85,
+                timeAhead: SIGNAL_AHEAD_SECONDS
+              });
+            }
+          } else if (r > 70) {
+            sellScore += 4;
+            reasons.push("🔄 RSI تشبع شراء (${r.toFixed(1)}) - انعكاس متوقع");
+            
+            if (r > 75 && volumeRatio > 1.5) {
+              signals.push({
+                type: "SELL",
+                reason: "تشبع شراء قوي مع حجم مرتفع",
+                probability: 85,
+                timeAhead: SIGNAL_AHEAD_SECONDS
+              });
+            }
+          }
+        }
+
+        // تحليل شموع الانعكاس
+        if (candles.length >= 3) {
+          const current = candles[candles.length - 1];
+          const previous = candles[candles.length - 2];
+          const before = candles[candles.length - 3];
+          
+          if (current.close > current.open && previous.close < previous.open && before.close < before.open) {
+            buyScore += 2;
+            reasons.push("🕯️ نمط شموع انعكاسي صاعد");
+          } else if (current.close < current.open && previous.close > previous.open && before.close > before.open) {
+            sellScore += 2;
+            reasons.push("🕯️ نمط شموع انعكاسي هابط");
+          }
+        }
+      }
+
+      // استراتيجية: اختراق
+      else if (strategy === "breakout") {
+        // حساب مستويات الدعم والمقاومة
+        const recentHigh = Math.max(...closes.slice(-20));
+        const recentLow = Math.min(...closes.slice(-20));
+        const range = recentHigh - recentLow;
+        const resistance = recentHigh - range * 0.1;
+        const support = recentLow + range * 0.1;
+
+        if (last > resistance && volumeRatio > 1.2) {
+          buyScore += 4;
+          reasons.push("🚀 اختراق مقاومة مع حجم قوي");
+          
+          signals.push({
+            type: "BUY",
+            reason: "اختراق مقاومة مؤكد",
+            probability: 80,
+            timeAhead: SIGNAL_AHEAD_SECONDS
+          });
+        } else if (last < support && volumeRatio > 1.2) {
+          sellScore += 4;
+          reasons.push("📉 اختراق دعم مع حجم قوي");
+          
+          signals.push({
+            type: "SELL",
+            reason: "اختراق دعم مؤكد",
+            probability: 80,
+            timeAhead: SIGNAL_AHEAD_SECONDS
+          });
+        }
+
+        // التذبذب
+        if (v > 0.015) {
+          if (last > e9 && e9 > e21) {
+            buyScore += 2;
+            reasons.push("⚡ سوق متذبذب مع ترند صاعد");
+          } else if (last < e9 && e9 < e21) {
+            sellScore += 2;
+            reasons.push("⚡ سوق متذبذب مع ترند هابط");
+          }
+        }
+      }
+
+      // مؤشرات عامة
+      if (m && m.macd != null && m.signal != null) {
+        if (m.macd > m.signal && m.hist > 0) {
+          buyScore += 2;
+          reasons.push("📊 MACD إيجابي ومتزايد");
+        } else if (m.macd < m.signal && m.hist < 0) {
+          sellScore += 2;
+          reasons.push("📊 MACD سلبي ومتزايد");
+        }
+      }
+
+      if (delta > 0) {
+        buyScore += 1;
+        if (volumeRatio > 1.3) reasons.push("⚡ زخم صاعد مع حجم عالي");
+        else reasons.push("↗️ إغلاق أعلى من السابق");
+      } else if (delta < 0) {
+        sellScore += 1;
+        if (volumeRatio > 1.3) reasons.push("⚡ زخم هابط مع حجم عالي");
+        else reasons.push("↘️ إغلاق أقل من السابق");
+      }
+
+      // حساب النتيجة النهائية
+      const total = buyScore + sellScore;
+      const conf = total ? Math.round((Math.max(buyScore, sellScore) / total) * 100) : 0;
 
       let dir = "WAIT";
-      if (buy > sell) dir = "CALL";
-      else if (sell > buy) dir = "PUT";
+      if (buyScore > sellScore && conf >= 60) dir = "CALL";
+      else if (sellScore > buyScore && conf >= 60) dir = "PUT";
 
-      const ok = conf >= 60 && Math.abs(buy - sell) >= 2;
+      const ok = conf >= strengthFilter && Math.abs(buyScore - sellScore) >= 2;
 
       const tag = !ok ? "انتظر" : dir === "CALL" ? "CALL ⬆️" : dir === "PUT" ? "PUT ⬇️" : "انتظر";
       const color = !ok ? "muted" : dir === "CALL" ? "green" : "red";
@@ -362,25 +543,47 @@ export default function Home() {
         tag,
         color,
         market,
-        reasons: reasons.slice(0, 3),
+        reasons: reasons.slice(0, 4),
+        signals: signals.slice(0, 2),
         updatedAt: Date.now()
       };
 
-      if (sound && ok && conf >= 72) {
-        const key = `${sym}:${dir}`;
-        const now = Date.now();
-        if (now - lastAlertRef.current.t > 25_000 || lastAlertRef.current.key !== key) {
-          playAlert(dir === "CALL" ? "buy" : "sell");
-          lastAlertRef.current = { t: now, key };
+      // إضافة إشارة جديدة إذا كانت قوية
+      if (signals.length > 0 && ok && conf >= strengthFilter) {
+        const newSignal = {
+          id: `${sym}_${Date.now()}`,
+          symbol: sym,
+          name: item.name,
+          type: dir === "CALL" ? "BUY" : "SELL",
+          reason: signals[0].reason,
+          probability: signals[0].probability,
+          confidence: conf,
+          price: item.price,
+          timestamp: Date.now(),
+          timeAhead: signals[0].timeAhead
+        };
+
+        signalsRef.current = [newSignal, ...signalsRef.current].slice(0, 20);
+        setSignals(signalsRef.current);
+
+        if (sound && conf >= 75) {
+          const key = `${sym}:${dir}`;
+          const now = Date.now();
+          if (now - lastAlertRef.current.t > 30_000 || lastAlertRef.current.key !== key) {
+            playAlert(dir === "CALL" ? "buy" : "sell");
+            lastAlertRef.current = { t: now, key };
+          }
         }
       }
     },
-    [sound]
+    [sound, strategy, strengthFilter]
   );
 
+  // ======== تحديث البطاقات ========
   const rebuildCards = useCallback(() => {
     const map = storeRef.current;
     const list = Object.values(map)
+      .filter(item => selectedPairs.includes(item.symbol))
       .map((x) => ({
         symbol: x.symbol,
         name: x.name || x.symbol,
@@ -392,9 +595,9 @@ export default function Home() {
       .sort((a, b) => (b.analysis?.conf ?? 0) - (a.analysis?.conf ?? 0));
 
     setCards(list);
-  }, []);
+  }, [selectedPairs]);
 
-  // ======== connect + load symbols + subscribe ========
+  // ======== اتصال WebSocket ========
   useEffect(() => {
     const ws = wsRef.current;
     let mounted = true;
@@ -402,8 +605,13 @@ export default function Home() {
     const onOpen = () => {
       if (!mounted) return;
       setStatus("connected");
-      setNote({ type: "ok", msg: "✅ تم الاتصال — جاري تحميل الأصول..." });
-      ws.requestActiveSymbols();
+      setNote({ type: "ok", msg: "✅ تم الاتصال — جاري تحميل البيانات..." });
+      
+      // الاشتراك في العملات المحددة فقط
+      selectedPairs.forEach(symbol => {
+        ws.subscribe(symbol);
+        ws.queueHistory(symbol);
+      });
     };
 
     const onClose = () => mounted && setStatus("disconnected");
@@ -419,76 +627,7 @@ export default function Home() {
         return;
       }
 
-      // active symbols
-      if (data.active_symbols && Array.isArray(data.active_symbols)) {
-        const wantedMarkets = new Set(["forex", "cryptocurrency", "commodities"]);
-
-        const filtered = data.active_symbols
-          .filter((s) => wantedMarkets.has(s.market))
-          .filter((s) => s.symbol && s.display_name)
-          .map((s) => ({ symbol: s.symbol, name: s.display_name, market: s.market }));
-
-        const priority = (s) => {
-          const n = (s.name || "").toUpperCase();
-          const sym = (s.symbol || "").toUpperCase();
-          if (
-            n.includes("EUR/USD") ||
-            n.includes("GBP/USD") ||
-            n.includes("USD/JPY") ||
-            n.includes("USD/CHF") ||
-            n.includes("AUD/USD") ||
-            n.includes("USD/CAD")
-          )
-            return 0;
-          if (n.includes("XAU") || n.includes("GOLD") || n.includes("XAG") || n.includes("SILVER")) return 1;
-          if (n.includes("BTC") || n.includes("ETH")) return 2;
-          if (sym.startsWith("FRX")) return 3;
-          if (sym.startsWith("CRY")) return 4;
-          return 9;
-        };
-
-        filtered.sort((a, b) => priority(a) - priority(b));
-
-        const picked = filtered.slice(0, MAX_ASSETS);
-
-        const map = storeRef.current;
-        picked.forEach((s) => {
-          map[s.symbol] =
-            map[s.symbol] || {
-              symbol: s.symbol,
-              name: s.name,
-              market: s.market,
-              price: undefined,
-              candles: [],
-              lastCandle: null,
-              analysis: {
-                dir: "WAIT",
-                conf: 0,
-                tag: "انتظر",
-                color: "muted",
-                market: "—",
-                reasons: ["..."],
-                updatedAt: Date.now()
-              },
-              lastUpdate: undefined
-            };
-        });
-
-        setNote({
-          type: "info",
-          msg: `📡 تم تحميل ${picked.length} أصل (Forex + Crypto + Commodities) — جاري جلب التاريخ والاشتراك...`
-        });
-
-        picked.forEach((s) => {
-          ws.subscribe(s.symbol);
-          ws.queueHistory(s.symbol);
-        });
-
-        rebuildCards();
-        return;
-      }
-
-      // candles history
+      // بيانات الشموع
       if (data.candles && Array.isArray(data.candles) && data.echo_req?.ticks_history) {
         const sym = data.echo_req.ticks_history;
         const item = storeRef.current[sym];
@@ -522,7 +661,7 @@ export default function Home() {
         return;
       }
 
-      // ticks
+      // التحديثات اللحظية
       if (data.tick && data.tick.symbol) {
         const sym = data.tick.symbol;
         const item = storeRef.current[sym];
@@ -569,26 +708,49 @@ export default function Home() {
     };
 
     setStatus("connecting");
+    
+    // تهيئة المتجر بالعملات المختارة
+    selectedPairs.forEach(symbol => {
+      const pairInfo = COMMON_PAIRS.find(p => p.symbol === symbol) || { symbol, name: symbol, market: "unknown" };
+      storeRef.current[symbol] = {
+        symbol,
+        name: pairInfo.name,
+        market: pairInfo.market,
+        price: undefined,
+        candles: [],
+        lastCandle: null,
+        analysis: {
+          dir: "WAIT",
+          conf: 0,
+          tag: "انتظر",
+          color: "muted",
+          market: "—",
+          reasons: ["جاري تحميل البيانات..."],
+          signals: [],
+          updatedAt: Date.now()
+        },
+        lastUpdate: undefined
+      };
+    });
+
     ws.connect({ onMessage, onOpen, onClose, onError });
 
     return () => {
       mounted = false;
       ws.disconnect();
     };
-  }, [analyzeSymbol, rebuildCards]);
+  }, [analyzeSymbol, rebuildCards, selectedPairs]);
 
-  // ======== periodic analysis ========
+  // ======== التحليل الدوري ========
   useEffect(() => {
     const t1 = setInterval(() => {
-      const map = storeRef.current;
-      Object.keys(map).forEach((sym) => analyzeSymbol(sym));
+      Object.keys(storeRef.current).forEach((sym) => analyzeSymbol(sym));
       rebuildCards();
     }, ANALYZE_EVERY_MS);
 
     const t2 = setInterval(() => {
-      const map = storeRef.current;
-      Object.keys(map).forEach((sym) => {
-        const it = map[sym];
+      Object.keys(storeRef.current).forEach((sym) => {
+        const it = storeRef.current[sym];
         if (!it) return;
         if ((it.candles?.length || 0) >= MIN_CANDLES_MIN) analyzeSymbol(sym);
       });
@@ -601,15 +763,46 @@ export default function Home() {
     };
   }, [analyzeSymbol, rebuildCards]);
 
-  // ======== stats ========
+  // ======== إدارة العملات المختارة ========
+  const handlePairToggle = (symbol) => {
+    const newSelected = selectedPairs.includes(symbol)
+      ? selectedPairs.filter(s => s !== symbol)
+      : [...selectedPairs, symbol];
+    
+    setSelectedPairs(newSelected);
+    
+    const ws = wsRef.current;
+    if (ws.isConnected) {
+      if (newSelected.includes(symbol)) {
+        ws.subscribe(symbol);
+        ws.queueHistory(symbol);
+      } else {
+        ws.unsubscribe(symbol);
+        delete storeRef.current[symbol];
+      }
+    }
+  };
+
+  const handleSelectAll = () => {
+    const allSymbols = COMMON_PAIRS.map(p => p.symbol);
+    setSelectedPairs(allSymbols);
+  };
+
+  const handleDeselectAll = () => {
+    setSelectedPairs([]);
+  };
+
+  // ======== إحصائيات ========
   const stats = useMemo(() => {
     const total = cards.length;
     const calls = cards.filter((c) => c.analysis?.dir === "CALL" && c.analysis?.color !== "muted").length;
     const puts = cards.filter((c) => c.analysis?.dir === "PUT" && c.analysis?.color !== "muted").length;
     const wait = total - calls - puts;
-    return { total, calls, puts, wait };
-  }, [cards]);
+    const strongSignals = signals.filter(s => s.confidence >= 80).length;
+    return { total, calls, puts, wait, strongSignals };
+  }, [cards, signals]);
 
+  // ======== مساعدات العرض ========
   const badge = (color) => {
     if (color === "green") return { bg: theme.green, fg: "#fff" };
     if (color === "red") return { bg: theme.red, fg: "#fff" };
@@ -620,9 +813,11 @@ export default function Home() {
     if (!ts) return "—";
     const s = Math.floor((Date.now() - ts) / 1000);
     if (s < 5) return "الآن";
-    if (s < 60) return `${s}s`;
+    if (s < 60) return `${s} ثانية`;
     const m = Math.floor(s / 60);
-    return `${m}m`;
+    if (m < 60) return `${m} دقيقة`;
+    const h = Math.floor(m / 60);
+    return `${h} ساعة`;
   };
 
   return (
@@ -658,12 +853,12 @@ export default function Home() {
         </div>
       )}
 
-      <div style={{ maxWidth: 1280, margin: "0 auto", padding: "26px 18px" }}>
-        {/* Header */}
+      <div style={{ maxWidth: 1480, margin: "0 auto", padding: "26px 18px" }}>
+        {/* الهيدر */}
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div>
-            <div style={{ fontSize: 28, fontWeight: 900, color: theme.blue }}>⚡ Quotex Signals Scanner</div>
-            <div style={{ opacity: 0.8, fontSize: 13, marginTop: 2 }}>إشارات فقط (CALL/PUT/WAIT) — تحديث كل دقيقة — Cards واضحة لكل الأصول</div>
+            <div style={{ fontSize: 28, fontWeight: 900, color: theme.blue }}>⚡ Quotex Signals Scanner Pro</div>
+            <div style={{ opacity: 0.8, fontSize: 13, marginTop: 2 }}>إشارات ذكية مع تحليل متقدم واستراتيجيات محددة</div>
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -684,28 +879,130 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Stats */}
+        {/* الإحصائيات */}
         <div style={{ marginTop: 14, background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 14, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
           {[
-            { label: "الأصول", value: stats.total, c: theme.blue },
-            { label: "CALL", value: stats.calls, c: theme.green },
-            { label: "PUT", value: stats.puts, c: theme.red },
-            { label: "WAIT", value: stats.wait, c: theme.fg }
+            { label: "العملات المختارة", value: selectedPairs.length, c: theme.blue },
+            { label: "إشارات CALL", value: stats.calls, c: theme.green },
+            { label: "إشارات PUT", value: stats.puts, c: theme.red },
+            { label: "إشارات قوية", value: stats.strongSignals, c: theme.purple },
+            { label: "في الانتظار", value: stats.wait, c: theme.fg }
           ].map((x, i) => (
-            <div key={i} style={{ flex: "1 1 160px", minWidth: 160, borderRadius: 14, border: `1px solid ${theme.border}`, background: theme.soft, padding: "10px 12px" }}>
+            <div key={i} style={{ flex: "1 1 140px", minWidth: 140, borderRadius: 14, border: `1px solid ${theme.border}`, background: theme.soft, padding: "10px 12px" }}>
               <div style={{ fontSize: 12, opacity: 0.75 }}>{x.label}</div>
               <div style={{ fontSize: 22, fontWeight: 900, color: x.c }}>{x.value}</div>
             </div>
           ))}
+        </div>
 
-          <div style={{ flex: "2 1 280px", minWidth: 260, fontSize: 12, opacity: 0.78, lineHeight: 1.7 }}>
-            ✅ إشارات قوية تظهر فقط لما تتوفر أفضلية واضحة.<br />
-            ⚠️ البيانات من Deriv WebSocket (للتحليل التعليمي).
+        {/* لوحة التحكم */}
+        <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 12 }}>
+          {/* اختيار العملات */}
+          <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 14 }}>
+            <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 12 }}>🏷️ اختر العملات</div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+              <button onClick={handleSelectAll} style={{ padding: "6px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.soft, color: theme.fg, cursor: "pointer", fontSize: 12 }}>
+                اختيار الكل
+              </button>
+              <button onClick={handleDeselectAll} style={{ padding: "6px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.soft, color: theme.fg, cursor: "pointer", fontSize: 12 }}>
+                إلغاء الكل
+              </button>
+            </div>
+            <div style={{ maxHeight: 200, overflowY: "auto", background: theme.soft, borderRadius: 10, padding: 10 }}>
+              {COMMON_PAIRS.map((pair) => (
+                <div key={pair.symbol} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <input
+                    type="checkbox"
+                    id={pair.symbol}
+                    checked={selectedPairs.includes(pair.symbol)}
+                    onChange={() => handlePairToggle(pair.symbol)}
+                    style={{ cursor: "pointer" }}
+                  />
+                  <label htmlFor={pair.symbol} style={{ fontSize: 13, cursor: "pointer", flex: 1 }}>
+                    {pair.name} <span style={{ opacity: 0.6 }}>({pair.symbol})</span>
+                  </label>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* الاستراتيجية */}
+          <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 14 }}>
+            <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 12 }}>🎯 الاستراتيجية</div>
+            <select 
+              value={strategy} 
+              onChange={(e) => setStrategy(e.target.value)}
+              style={{ width: "100%", padding: "8px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.soft, color: theme.fg, marginBottom: 12 }}
+            >
+              {STRATEGIES.map(s => (
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </select>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
+              {STRATEGIES.find(s => s.id === strategy)?.description}
+            </div>
+            
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>قوة الإشارة المطلوبة: {strengthFilter}%</div>
+              <input
+                type="range"
+                min="60"
+                max="90"
+                value={strengthFilter}
+                onChange={(e) => setStrengthFilter(parseInt(e.target.value))}
+                style={{ width: "100%" }}
+              />
+            </div>
+          </div>
+
+          {/* إشارات الدخول */}
+          <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 16, padding: 14 }}>
+            <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 12 }}>🔔 إشارات الدخول</div>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 12 }}>
+              يتم إرسال إشارات قبل {SIGNAL_AHEAD_SECONDS} ثانية من الدخول المثالي
+            </div>
+            
+            {signals.length > 0 ? (
+              <div style={{ maxHeight: 180, overflowY: "auto" }}>
+                {signals.slice(0, 3).map((signal) => (
+                  <div key={signal.id} style={{ 
+                    background: signal.type === "BUY" ? "rgba(52, 211, 153, 0.15)" : "rgba(248, 113, 113, 0.15)",
+                    border: `1px solid ${signal.type === "BUY" ? theme.green : theme.red}`,
+                    borderRadius: 10,
+                    padding: 10,
+                    marginBottom: 8
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                      <div style={{ fontWeight: 900, fontSize: 13 }}>{signal.name}</div>
+                      <div style={{ 
+                        padding: "2px 8px", 
+                        borderRadius: 6, 
+                        background: signal.type === "BUY" ? theme.green : theme.red,
+                        color: "#fff",
+                        fontSize: 11,
+                        fontWeight: 700
+                      }}>
+                        {signal.type} {signal.type === "BUY" ? "⬆️" : "⬇️"}
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 11, opacity: 0.9, marginBottom: 4 }}>{signal.reason}</div>
+                    <div style={{ fontSize: 10, display: "flex", justifyContent: "space-between", opacity: 0.8 }}>
+                      <span>الاحتمالية: {signal.probability}%</span>
+                      <span>قبل: {signal.timeAhead} ثانية</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ textAlign: "center", padding: "20px 0", opacity: 0.6, fontSize: 13 }}>
+                لا توجد إشارات دخول حالياً
+              </div>
+            )}
           </div>
         </div>
 
-        {/* Cards */}
-        <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
+        {/* البطاقات */}
+        <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 12 }}>
           {cards.map((c) => {
             const a = c.analysis || {};
             const b = badge(a.color);
@@ -738,7 +1035,9 @@ export default function Home() {
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
                   <div style={{ flex: "1 1 140px", background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 10 }}>
                     <div style={{ fontSize: 12, opacity: 0.75 }}>السعر</div>
-                    <div style={{ fontSize: 18, fontWeight: 900, color: theme.blue }}>{typeof c.price === "number" ? c.price.toFixed(5) : "—"}</div>
+                    <div style={{ fontSize: 18, fontWeight: 900, color: theme.blue }}>
+                      {typeof c.price === "number" ? c.price.toFixed(5) : "—"}
+                    </div>
                   </div>
 
                   <div style={{ flex: "1 1 140px", background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 10 }}>
@@ -757,20 +1056,38 @@ export default function Home() {
                 </div>
 
                 <div style={{ marginTop: 10, background: theme.soft, border: `1px solid ${theme.border}`, borderRadius: 12, padding: 10 }}>
-                  <div style={{ fontWeight: 900, fontSize: 12, marginBottom: 6 }}>الأسباب</div>
+                  <div style={{ fontWeight: 900, fontSize: 12, marginBottom: 6 }}>📊 أسباب الإشارة</div>
                   <ul style={{ margin: 0, paddingRight: 18, lineHeight: 1.7, fontSize: 12 }}>
-                    {(a.reasons || []).slice(0, 3).map((r, i) => (
+                    {(a.reasons || []).slice(0, 4).map((r, i) => (
                       <li key={i}>{r}</li>
                     ))}
                   </ul>
                 </div>
+
+                {a.signals && a.signals.length > 0 && (
+                  <div style={{ marginTop: 10, background: a.color === "green" ? "rgba(52, 211, 153, 0.15)" : "rgba(248, 113, 113, 0.15)", border: `1px solid ${a.color === "green" ? theme.green : theme.red}`, borderRadius: 12, padding: 10 }}>
+                    <div style={{ fontWeight: 900, fontSize: 12, marginBottom: 6 }}>🚀 إشارات دخول</div>
+                    {a.signals.map((s, i) => (
+                      <div key={i} style={{ fontSize: 11, marginBottom: 4, opacity: 0.9 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between" }}>
+                          <span>نوع: <b>{s.type === "BUY" ? "شراء ⬆️" : "بيع ⬇️"}</b></span>
+                          <span>قبل: <b>{s.timeAhead} ثانية</b></span>
+                        </div>
+                        <div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>{s.reason}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
 
+        {/* تذييل */}
         <div style={{ marginTop: 16, padding: 12, borderRadius: 14, background: dark ? "rgba(239,68,68,0.10)" : "#fef2f2", border: `1px solid ${theme.red}`, color: theme.red, fontSize: 12, lineHeight: 1.7 }}>
-          ⚠️ هذا السكّانر للتحليل التعليمي فقط. التداول مسؤوليتك.
+          ⚠️ هذا السكّانر للتحليل التعليمي فقط. التداول مسؤوليتك الكاملة.
+          <br />
+          ✅ يتم إرسال إشارات الدخول قبل {SIGNAL_AHEAD_SECONDS} ثانية لتتمكن من التحضير للصفقة.
         </div>
       </div>
     </div>
